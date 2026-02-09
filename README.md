@@ -121,6 +121,18 @@ cargo fmt -- --check  # formatting
 cargo clippy --all-targets  # lints (example warnings are expected without a backend feature)
 ```
 
+## Benchmarks
+
+Criterion benchmarks cover all core operations using Qwen3-0.6B dimensions on CPU (NdArray backend). No GPU or model weights needed.
+
+```bash
+cargo bench --features bench              # All 48 benchmarks
+cargo bench --features bench -- rms_norm  # Single group
+cargo bench --features bench -- "attention/decode"  # Subset
+```
+
+Benchmark groups: `rms_norm`, `rope`, `feed_forward`, `moe_layer`, `attention`, `transformer_block`, `causal_mask`, `kv_cache`. Each group sweeps sequence lengths (1 to 512). Attention and transformer block groups include both prefill and decode scenarios. HTML reports are written to `target/criterion/`.
+
 ## Backends
 
 | Feature | Backend | Notes |

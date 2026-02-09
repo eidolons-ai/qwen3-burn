@@ -11,6 +11,7 @@ std = []
 wgpu = ["burn/wgpu"]
 ndarray = ["burn/ndarray"]
 cuda = ["burn/cuda"]
+bench = []
 
 [[example]]
 name = "chat"
@@ -27,3 +28,8 @@ half = { version = "2.4", features = ["serde"] }
 [dev-dependencies]
 clap = { version = "4", features = ["derive"] }
 burn = { version = "0.20.0", default-features = false, features = ["std", "ndarray"] }
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "ops"
+harness = false
