@@ -58,6 +58,13 @@ cargo check --features wgpu
 # Build release
 cargo build --release --features wgpu --example chat
 
+# Run tests (no GPU or model weights needed — uses ndarray backend via dev-dependencies)
+cargo test
+
+# Lint
+cargo fmt -- --check
+cargo clippy --all-targets
+
 # Run (needs model files in a directory: config.json, tokenizer.json, *.safetensors)
 cargo run --release --features wgpu --example chat -- \
   --model-path ./models/Qwen3-0.6B --prompt "Hello" --max-tokens 100
@@ -67,6 +74,8 @@ python3 -c "from huggingface_hub import snapshot_download; snapshot_download('Qw
 ```
 
 Backend features are mutually exclusive: `wgpu` (Metal on macOS), `ndarray` (CPU), `cuda`.
+
+Tests use `NdArray` backend (CPU) via dev-dependencies and require no model weights. 47 unit tests cover config parsing, RmsNorm, RoPE, causal mask, KV cache, MoE routing, sampling, and end-to-end shape verification for both dense and MoE transformer blocks.
 
 ## Key Implementation Details
 

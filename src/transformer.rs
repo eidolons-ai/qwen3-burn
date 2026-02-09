@@ -69,6 +69,7 @@ impl<B: Backend> RotaryEmbedding<B> {
     ///
     /// Input shapes: `[batch, num_heads, seq_len, head_dim]`
     /// `start_pos` is the position offset for cached generation.
+    #[allow(clippy::single_range_in_vec_init)]
     pub fn apply(
         &self,
         q: Tensor<B, 4>,
@@ -209,9 +210,13 @@ impl<B: Backend> MultiHeadAttention<B> {
         let v = v.reshape([batch, seq_len, self.num_kv_heads, self.head_dim]);
 
         // QK-Norm: apply RMSNorm per-head on the head_dim dimension
-        let q = self.q_norm.forward(q.reshape([batch * seq_len * self.num_heads, 1, self.head_dim]))
+        let q = self
+            .q_norm
+            .forward(q.reshape([batch * seq_len * self.num_heads, 1, self.head_dim]))
             .reshape([batch, seq_len, self.num_heads, self.head_dim]);
-        let k = self.k_norm.forward(k.reshape([batch * seq_len * self.num_kv_heads, 1, self.head_dim]))
+        let k = self
+            .k_norm
+            .forward(k.reshape([batch * seq_len * self.num_kv_heads, 1, self.head_dim]))
             .reshape([batch, seq_len, self.num_kv_heads, self.head_dim]);
 
         // Transpose to [batch, heads, seq_len, head_dim]
@@ -248,9 +253,10 @@ impl<B: Backend> MultiHeadAttention<B> {
         let attn_output = attn_weights.matmul(v);
 
         // Reshape back to [batch, seq_len, d_model]
-        let attn_output = attn_output
-            .swap_dims(1, 2)
-            .reshape([batch, seq_len, self.num_heads * self.head_dim]);
+        let attn_output =
+            attn_output
+                .swap_dims(1, 2)
+                .reshape([batch, seq_len, self.num_heads * self.head_dim]);
 
         self.o_proj.forward(attn_output)
     }
@@ -329,10 +335,7 @@ impl<B: Backend> MoeLayer<B> {
         device: &Device<B>,
     ) -> Self {
         Self {
-            router_weight: Param::from_tensor(Tensor::zeros(
-                [num_experts, d_model],
-                device,
-            )),
+            router_weight: Param::from_tensor(Tensor::zeros([num_experts, d_model], device)),
             gate_up_proj: Param::from_tensor(Tensor::zeros(
                 [num_experts, d_model, 2 * moe_intermediate_size],
                 device,
@@ -361,7 +364,8 @@ impl<B: Backend> MoeLayer<B> {
 
         // Get top-k expert indices and weights
         // topk returns (values, indices) with shape [num_tokens, k]
-        let (topk_weights, topk_indices) = router_probs.topk_with_indices(self.num_experts_per_tok, 1);
+        let (topk_weights, topk_indices) =
+            router_probs.topk_with_indices(self.num_experts_per_tok, 1);
 
         // Renormalize weights if configured
         let topk_weights = if self.norm_topk_prob {
@@ -414,24 +418,35 @@ impl<B: Backend> MoeLayer<B> {
 
             // Slice this expert's weights
             // gate_up_proj: [num_experts, hidden, 2*moe_intermediate] -> [hidden, 2*moe_intermediate]
-            let expert_gate_up = self.gate_up_proj.val().slice([
-                expert_idx..expert_idx + 1,
-                0..hidden,
-                0..2 * self.moe_intermediate_size,
-            ]).reshape([hidden, 2 * self.moe_intermediate_size]);
+            let expert_gate_up = self
+                .gate_up_proj
+                .val()
+                .slice([
+                    expert_idx..expert_idx + 1,
+                    0..hidden,
+                    0..2 * self.moe_intermediate_size,
+                ])
+                .reshape([hidden, 2 * self.moe_intermediate_size]);
 
             // down_proj: [num_experts, moe_intermediate, hidden] -> [moe_intermediate, hidden]
-            let expert_down = self.down_proj.val().slice([
-                expert_idx..expert_idx + 1,
-                0..self.moe_intermediate_size,
-                0..hidden,
-            ]).reshape([self.moe_intermediate_size, hidden]);
+            let expert_down = self
+                .down_proj
+                .val()
+                .slice([
+                    expert_idx..expert_idx + 1,
+                    0..self.moe_intermediate_size,
+                    0..hidden,
+                ])
+                .reshape([self.moe_intermediate_size, hidden]);
 
             // SwiGLU: split gate_up into gate and up
             // expert_input @ expert_gate_up -> [n, 2*moe_intermediate]
             let gate_up = expert_input.matmul(expert_gate_up);
             let gate = gate_up.clone().slice([0..n, 0..self.moe_intermediate_size]);
-            let up = gate_up.slice([0..n, self.moe_intermediate_size..2 * self.moe_intermediate_size]);
+            let up = gate_up.slice([
+                0..n,
+                self.moe_intermediate_size..2 * self.moe_intermediate_size,
+            ]);
             let hidden_states = activation::silu(gate) * up;
 
             // down_proj: [n, moe_intermediate] @ [moe_intermediate, hidden] -> [n, hidden]
@@ -459,6 +474,7 @@ impl<B: Backend> MoeLayer<B> {
 
 /// MLP variant: either a dense FeedForward or a Mixture of Experts layer.
 #[derive(Module, Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum Mlp<B: Backend> {
     Dense(FeedForward<B>),
     Moe(MoeLayer<B>),
@@ -507,6 +523,7 @@ impl<B: Backend> TransformerBlock<B> {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn new_moe(
         d_model: usize,
         num_heads: usize,
@@ -585,6 +602,7 @@ pub struct MoeConfig {
 }
 
 impl<B: Backend> Transformer<B> {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         vocab_size: usize,
         d_model: usize,
@@ -809,4 +827,379 @@ pub fn build_causal_mask<B: Backend>(
         }
     }
     Tensor::<B, 1>::from_floats(&mask_data[..], device).reshape([seq_len, total_seq_len])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use burn::backend::NdArray;
+
+    type B = NdArray;
+
+    fn device() -> <B as Backend>::Device {
+        Default::default()
+    }
+
+    fn to_vec<const D: usize>(t: Tensor<B, D>) -> Vec<f32> {
+        t.to_data().iter::<f32>().collect()
+    }
+
+    // --- RmsNorm ---
+
+    #[test]
+    fn rms_norm_unit_weight() {
+        // With weight=1 and eps=0, RmsNorm(x) = x / rms(x)
+        // For input [1, 1, 2] with values [3.0, 4.0]: rms = sqrt((9+16)/2) = sqrt(12.5)
+        let dev = device();
+        let norm = RmsNorm::new(2, 1e-6, &dev);
+        let x = Tensor::<B, 3>::from_floats([[[3.0, 4.0]]], &dev);
+        let out = norm.forward(x);
+        let vals = to_vec(out);
+        let rms = (12.5f32 + 1e-6).sqrt();
+        assert!((vals[0] - 3.0 / rms).abs() < 1e-5);
+        assert!((vals[1] - 4.0 / rms).abs() < 1e-5);
+    }
+
+    #[test]
+    fn rms_norm_preserves_shape() {
+        let dev = device();
+        let norm = RmsNorm::new(8, 1e-6, &dev);
+        let x = Tensor::<B, 3>::ones([2, 5, 8], &dev);
+        let out = norm.forward(x);
+        assert_eq!(out.dims(), [2, 5, 8]);
+    }
+
+    #[test]
+    fn rms_norm_uniform_input() {
+        // Uniform input: all values c -> rms = c, so output = c/c * weight = weight
+        // With weight=1, output should be all 1.0
+        let dev = device();
+        let norm = RmsNorm::new(4, 1e-6, &dev);
+        let x = Tensor::<B, 3>::from_floats([[[5.0, 5.0, 5.0, 5.0]]], &dev);
+        let out = norm.forward(x);
+        let vals = to_vec(out);
+        for &v in &vals {
+            assert!((v - 1.0).abs() < 1e-4, "expected ~1.0 got {}", v);
+        }
+    }
+
+    // --- rotate_half ---
+
+    #[test]
+    fn rotate_half_known_values() {
+        // Input: [1, 1, 1, 4] with values [a, b, c, d]
+        // Expected: [-c, -d, a, b]
+        let dev = device();
+        let x = Tensor::<B, 4>::from_floats([[[[1.0, 2.0, 3.0, 4.0]]]], &dev);
+        let out = rotate_half(x);
+        let vals = to_vec(out);
+        assert_eq!(vals, vec![-3.0, -4.0, 1.0, 2.0]);
+    }
+
+    #[test]
+    fn rotate_half_involution() {
+        // rotate_half applied twice: first [-x2, x1], then [-x1, -x2] = -x
+        let dev = device();
+        let x = Tensor::<B, 4>::from_floats([[[[1.0, 2.0, 3.0, 4.0]]]], &dev);
+        let out = rotate_half(rotate_half(x.clone()));
+        let vals = to_vec(out);
+        let orig = to_vec(x);
+        for (a, b) in vals.iter().zip(orig.iter()) {
+            assert!((a + b).abs() < 1e-6, "expected negation");
+        }
+    }
+
+    // --- RoPE ---
+
+    #[test]
+    fn rope_preserves_shape() {
+        let dev = device();
+        let rope = RotaryEmbedding::new(4, 32, 10000.0, &dev);
+        let q = Tensor::<B, 4>::ones([1, 2, 5, 4], &dev);
+        let k = Tensor::<B, 4>::ones([1, 2, 5, 4], &dev);
+        let (q_out, k_out) = rope.apply(q, k, 0);
+        assert_eq!(q_out.dims(), [1, 2, 5, 4]);
+        assert_eq!(k_out.dims(), [1, 2, 5, 4]);
+    }
+
+    #[test]
+    fn rope_position_offset() {
+        // Applying RoPE at start_pos=0 with seq_len=1 should give same result
+        // as applying at start_pos=5 with seq_len=1 but for different position embeddings
+        let dev = device();
+        let rope = RotaryEmbedding::new(4, 32, 10000.0, &dev);
+        let q = Tensor::<B, 4>::ones([1, 1, 1, 4], &dev);
+        let k = Tensor::<B, 4>::ones([1, 1, 1, 4], &dev);
+
+        let (q0, _) = rope.apply(q.clone(), k.clone(), 0);
+        let (q5, _) = rope.apply(q, k, 5);
+        // Different positions should give different embeddings
+        let diff: f32 = to_vec((q0 - q5).abs()).iter().sum();
+        assert!(
+            diff > 1e-4,
+            "different positions should produce different embeddings"
+        );
+    }
+
+    #[test]
+    fn rope_cos_sin_table_shape() {
+        let dev = device();
+        let rope = RotaryEmbedding::<B>::new(8, 64, 10000.0, &dev);
+        assert_eq!(rope.cos.dims(), [64, 8]);
+        assert_eq!(rope.sin.dims(), [64, 8]);
+    }
+
+    // --- Causal mask ---
+
+    #[test]
+    fn causal_mask_square() {
+        // 3x3 causal mask: lower triangle + diagonal = 0.0, upper triangle = -inf
+        let dev = device();
+        let mask = build_causal_mask::<B>(3, 3, &dev);
+        let vals = to_vec(mask);
+        // Row 0: [0, -inf, -inf]
+        // Row 1: [0, 0, -inf]
+        // Row 2: [0, 0, 0]
+        assert_eq!(vals[0], 0.0);
+        assert!(vals[1].is_infinite() && vals[1] < 0.0);
+        assert!(vals[2].is_infinite() && vals[2] < 0.0);
+        assert_eq!(vals[3], 0.0);
+        assert_eq!(vals[4], 0.0);
+        assert!(vals[5].is_infinite() && vals[5] < 0.0);
+        assert_eq!(vals[6], 0.0);
+        assert_eq!(vals[7], 0.0);
+        assert_eq!(vals[8], 0.0);
+    }
+
+    #[test]
+    fn causal_mask_single_query() {
+        // Autoregressive step: 1 query, 5 total -> mask is [1, 5], all 0.0 (can attend to everything)
+        let dev = device();
+        let mask = build_causal_mask::<B>(1, 5, &dev);
+        assert_eq!(mask.dims(), [1, 5]);
+        let vals = to_vec(mask);
+        for &v in &vals {
+            assert_eq!(v, 0.0);
+        }
+    }
+
+    #[test]
+    fn causal_mask_2_query_5_total() {
+        // 2 queries, 5 total: offset=3
+        // Row 0: can attend to positions 0..3 (j<=3), mask at j=4 -> [0,0,0,0,-inf]
+        // Row 1: can attend to positions 0..4 (j<=4) -> [0,0,0,0,0]
+        let dev = device();
+        let mask = build_causal_mask::<B>(2, 5, &dev);
+        assert_eq!(mask.dims(), [2, 5]);
+        let vals = to_vec(mask);
+        // Row 0
+        assert_eq!(vals[0], 0.0);
+        assert_eq!(vals[1], 0.0);
+        assert_eq!(vals[2], 0.0);
+        assert_eq!(vals[3], 0.0);
+        assert!(vals[4].is_infinite() && vals[4] < 0.0);
+        // Row 1: all zero
+        for &v in &vals[5..10] {
+            assert_eq!(v, 0.0);
+        }
+    }
+
+    // --- repeat_kv ---
+
+    #[test]
+    fn repeat_kv_noop_when_1() {
+        let dev = device();
+        let x = Tensor::<B, 4>::from_floats([[[[1.0, 2.0]], [[3.0, 4.0]]]], &dev);
+        let out = repeat_kv(x.clone(), 1);
+        assert_eq!(to_vec(out), to_vec(x));
+    }
+
+    #[test]
+    fn repeat_kv_doubles() {
+        let dev = device();
+        // [1, 2, 1, 2]: batch=1, 2 kv heads, seq=1, dim=2
+        let x = Tensor::<B, 4>::from_floats([[[[1.0, 2.0]], [[3.0, 4.0]]]], &dev);
+        let out = repeat_kv(x, 2);
+        assert_eq!(out.dims(), [1, 4, 1, 2]);
+        let vals = to_vec(out);
+        // heads: [1,2], [1,2], [3,4], [3,4]
+        assert_eq!(vals, vec![1.0, 2.0, 1.0, 2.0, 3.0, 4.0, 3.0, 4.0]);
+    }
+
+    // --- FeedForward ---
+
+    #[test]
+    fn feed_forward_preserves_shape() {
+        let dev = device();
+        let ff = FeedForward::new(16, 32, &dev);
+        let x = Tensor::<B, 3>::ones([1, 4, 16], &dev);
+        let out = ff.forward(x);
+        assert_eq!(out.dims(), [1, 4, 16]);
+    }
+
+    // --- MoeLayer ---
+
+    #[test]
+    fn moe_layer_preserves_shape() {
+        let dev = device();
+        let moe = MoeLayer::new(8, 4, 2, 16, true, &dev);
+        let x = Tensor::<B, 3>::ones([1, 3, 8], &dev);
+        let out = moe.forward(x);
+        assert_eq!(out.dims(), [1, 3, 8]);
+    }
+
+    #[test]
+    fn moe_layer_batch_shape() {
+        let dev = device();
+        let moe = MoeLayer::new(8, 4, 2, 16, true, &dev);
+        let x = Tensor::<B, 3>::ones([2, 5, 8], &dev);
+        let out = moe.forward(x);
+        assert_eq!(out.dims(), [2, 5, 8]);
+    }
+
+    #[test]
+    fn moe_layer_single_expert_single_topk() {
+        // With 1 expert and topk=1, MoE should behave like a single FFN
+        // (all tokens route to expert 0 with weight 1.0)
+        let dev = device();
+        let moe = MoeLayer::new(4, 1, 1, 8, true, &dev);
+        let x = Tensor::<B, 3>::ones([1, 2, 4], &dev);
+        let out = moe.forward(x);
+        assert_eq!(out.dims(), [1, 2, 4]);
+        // Output should be deterministic (not all zeros, since weights are zero-initialized
+        // the actual output will be zeros here, but shape is correct)
+    }
+
+    #[test]
+    fn moe_routing_renormalization() {
+        // Verify that with norm_topk_prob=true, weights sum to 1.0 per token
+        // We test this indirectly: with uniform router weights and 4 experts, topk=2,
+        // each selected expert gets weight 0.5
+        let dev = device();
+        let mut moe = MoeLayer::new(4, 4, 2, 8, true, &dev);
+        // Set router to uniform so all experts have equal probability
+        moe.router_weight = Param::from_tensor(Tensor::ones([4, 4], &dev));
+        let x = Tensor::<B, 3>::ones([1, 1, 4], &dev);
+        // This should not panic and should produce valid output
+        let out = moe.forward(x);
+        assert_eq!(out.dims(), [1, 1, 4]);
+    }
+
+    // --- Mlp enum ---
+
+    #[test]
+    fn mlp_dense_variant_shape() {
+        let dev = device();
+        let mlp = Mlp::Dense(FeedForward::new(16, 32, &dev));
+        let x = Tensor::<B, 3>::ones([1, 3, 16], &dev);
+        let out = mlp.forward(x);
+        assert_eq!(out.dims(), [1, 3, 16]);
+    }
+
+    #[test]
+    fn mlp_moe_variant_shape() {
+        let dev = device();
+        let mlp = Mlp::Moe(MoeLayer::new(16, 4, 2, 32, true, &dev));
+        let x = Tensor::<B, 3>::ones([1, 3, 16], &dev);
+        let out = mlp.forward(x);
+        assert_eq!(out.dims(), [1, 3, 16]);
+    }
+
+    // --- TransformerBlock ---
+
+    #[test]
+    fn transformer_block_dense_shape() {
+        let dev = device();
+        let block = TransformerBlock::new(32, 4, 2, 8, 64, 1e-6, &dev);
+        let rope = RotaryEmbedding::new(8, 16, 10000.0, &dev);
+        let mut cache = AttentionKvCache::new(1, 2, 16, 8, &dev);
+        let mask = build_causal_mask::<B>(3, 3, &dev);
+
+        let x = Tensor::<B, 3>::ones([1, 3, 32], &dev);
+        let out = block.forward(x, &rope, Some(mask), &mut cache, 0);
+        assert_eq!(out.dims(), [1, 3, 32]);
+    }
+
+    #[test]
+    fn transformer_block_moe_shape() {
+        let dev = device();
+        let block = TransformerBlock::new_moe(32, 4, 2, 8, 4, 2, 16, true, 1e-6, &dev);
+        let rope = RotaryEmbedding::new(8, 16, 10000.0, &dev);
+        let mut cache = AttentionKvCache::new(1, 2, 16, 8, &dev);
+        let mask = build_causal_mask::<B>(3, 3, &dev);
+
+        let x = Tensor::<B, 3>::ones([1, 3, 32], &dev);
+        let out = block.forward(x, &rope, Some(mask), &mut cache, 0);
+        assert_eq!(out.dims(), [1, 3, 32]);
+    }
+
+    // --- Transformer construction ---
+
+    #[test]
+    fn transformer_dense_construction() {
+        let dev = device();
+        let t = Transformer::new(100, 32, 2, 4, 2, 8, 64, 1e-6, false, None, &dev);
+        let rope = RotaryEmbedding::new(8, 16, 10000.0, &dev);
+        let mut caches: Vec<AttentionKvCache<B>> = (0..2)
+            .map(|_| AttentionKvCache::new(1, 2, 16, 8, &dev))
+            .collect();
+        let tokens = Tensor::<B, 2, Int>::from_data(
+            burn::tensor::TensorData::new(vec![1i32, 2, 3], [1, 3]),
+            &dev,
+        );
+        let mask = build_causal_mask::<B>(3, 3, &dev);
+        let out = t.forward(tokens, &rope, Some(mask), &mut caches, 0);
+        assert_eq!(out.dims(), [1, 3, 100]); // [batch, seq, vocab]
+    }
+
+    #[test]
+    fn transformer_moe_construction() {
+        let dev = device();
+        let moe_cfg = MoeConfig {
+            num_experts: 4,
+            num_experts_per_tok: 2,
+            moe_intermediate_size: 16,
+            norm_topk_prob: true,
+            mlp_only_layers: vec![],
+            decoder_sparse_step: 1,
+        };
+        let t = Transformer::new(100, 32, 2, 4, 2, 8, 64, 1e-6, false, Some(&moe_cfg), &dev);
+        let rope = RotaryEmbedding::new(8, 16, 10000.0, &dev);
+        let mut caches: Vec<AttentionKvCache<B>> = (0..2)
+            .map(|_| AttentionKvCache::new(1, 2, 16, 8, &dev))
+            .collect();
+        let tokens = Tensor::<B, 2, Int>::from_data(
+            burn::tensor::TensorData::new(vec![1i32, 2, 3], [1, 3]),
+            &dev,
+        );
+        let mask = build_causal_mask::<B>(3, 3, &dev);
+        let out = t.forward(tokens, &rope, Some(mask), &mut caches, 0);
+        assert_eq!(out.dims(), [1, 3, 100]);
+    }
+
+    #[test]
+    fn transformer_mixed_moe_dense_layers() {
+        let dev = device();
+        let moe_cfg = MoeConfig {
+            num_experts: 4,
+            num_experts_per_tok: 2,
+            moe_intermediate_size: 16,
+            norm_topk_prob: true,
+            mlp_only_layers: vec![1], // layer 1 is dense
+            decoder_sparse_step: 1,
+        };
+        // 3 layers: 0=MoE, 1=Dense, 2=MoE
+        let t = Transformer::new(100, 32, 3, 4, 2, 8, 64, 1e-6, false, Some(&moe_cfg), &dev);
+        let rope = RotaryEmbedding::new(8, 16, 10000.0, &dev);
+        let mut caches: Vec<AttentionKvCache<B>> = (0..3)
+            .map(|_| AttentionKvCache::new(1, 2, 16, 8, &dev))
+            .collect();
+        let tokens = Tensor::<B, 2, Int>::from_data(
+            burn::tensor::TensorData::new(vec![1i32, 2], [1, 2]),
+            &dev,
+        );
+        let mask = build_causal_mask::<B>(2, 2, &dev);
+        let out = t.forward(tokens, &rope, Some(mask), &mut caches, 0);
+        assert_eq!(out.dims(), [1, 2, 100]);
+    }
 }

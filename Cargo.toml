@@ -26,3 +26,4 @@ half = { version = "2.4", features = ["serde"] }
 
 [dev-dependencies]
 clap = { version = "4", features = ["derive"] }
+burn = { version = "0.20.0", default-features = false, features = ["std", "ndarray"] }

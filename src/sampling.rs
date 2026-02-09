@@ -67,3 +67,87 @@ impl TopP {
         probs_idx.slice([0..1, next_token_idx..next_token_idx + 1])
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use burn::backend::NdArray;
+
+    type B = NdArray;
+
+    fn device() -> <B as Backend>::Device {
+        Default::default()
+    }
+
+    fn sample_id(sampler: &mut Sampler, probs: Tensor<B, 2>) -> i64 {
+        let out = sampler.sample(probs);
+        out.to_data().iter::<i64>().next().unwrap()
+    }
+
+    #[test]
+    fn argmax_picks_highest() {
+        let dev = device();
+        let mut sampler = Sampler::Argmax;
+        // Token 2 has highest probability
+        let probs = Tensor::<B, 2>::from_floats([[0.1, 0.2, 0.5, 0.15, 0.05]], &dev);
+        assert_eq!(sample_id(&mut sampler, probs), 2);
+    }
+
+    #[test]
+    fn argmax_first_on_tie() {
+        let dev = device();
+        let mut sampler = Sampler::Argmax;
+        let probs = Tensor::<B, 2>::from_floats([[0.5, 0.5, 0.0]], &dev);
+        // argmax returns first occurrence
+        assert_eq!(sample_id(&mut sampler, probs), 0);
+    }
+
+    #[test]
+    fn argmax_deterministic() {
+        let dev = device();
+        let mut sampler = Sampler::Argmax;
+        let probs = Tensor::<B, 2>::from_floats([[0.1, 0.3, 0.6]], &dev);
+        // Same input should always give same output
+        let r1 = sample_id(&mut sampler, probs.clone());
+        let r2 = sample_id(&mut sampler, probs);
+        assert_eq!(r1, r2);
+        assert_eq!(r1, 2);
+    }
+
+    #[test]
+    fn top_p_returns_valid_index() {
+        let dev = device();
+        let mut sampler = Sampler::new_top_p(0.9, 42);
+        let probs = Tensor::<B, 2>::from_floats([[0.1, 0.2, 0.3, 0.4]], &dev);
+        let idx = sample_id(&mut sampler, probs);
+        assert!((0..4).contains(&idx));
+    }
+
+    #[test]
+    fn top_p_with_p_1_can_sample_any() {
+        // With p=1.0, all tokens are candidates
+        let dev = device();
+        let probs = Tensor::<B, 2>::from_floats([[0.25, 0.25, 0.25, 0.25]], &dev);
+        // Run multiple samples, verify all are in range
+        let mut sampler = Sampler::new_top_p(1.0, 123);
+        for _ in 0..20 {
+            let idx = sample_id(&mut sampler, probs.clone());
+            assert!((0..4).contains(&idx), "index {} out of range", idx);
+        }
+    }
+
+    #[test]
+    fn top_p_concentrates_on_top() {
+        // With very low p, should almost always pick the highest-probability token
+        let dev = device();
+        let probs = Tensor::<B, 2>::from_floats([[0.01, 0.01, 0.01, 0.97]], &dev);
+        let mut sampler = Sampler::new_top_p(0.1, 42);
+        for _ in 0..10 {
+            let idx = sample_id(&mut sampler, probs.clone());
+            assert_eq!(
+                idx, 3,
+                "with p=0.1 and 0.97 mass on token 3, should always pick 3"
+            );
+        }
+    }
+}

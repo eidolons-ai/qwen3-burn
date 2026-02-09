@@ -46,7 +46,12 @@ impl<B: Backend> KvCache<B> {
                 0..head_dim,
             ]);
             self.cache = self.cache.clone().slice_assign(
-                [0..batch_size, 0..num_heads, 0..self.cur_seq_len, 0..head_dim],
+                [
+                    0..batch_size,
+                    0..num_heads,
+                    0..self.cur_seq_len,
+                    0..head_dim,
+                ],
                 prev_slice,
             );
             new_seq_len = self.max_seq_len;
@@ -64,14 +69,119 @@ impl<B: Backend> KvCache<B> {
 
         self.cur_seq_len += seq_len;
 
-        self.cache
-            .clone()
-            .slice([0..batch_size, 0..num_heads, 0..self.cur_seq_len, 0..head_dim])
+        self.cache.clone().slice([
+            0..batch_size,
+            0..num_heads,
+            0..self.cur_seq_len,
+            0..head_dim,
+        ])
     }
 
     /// Returns the current cached sequence length.
     #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.cur_seq_len
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use burn::backend::NdArray;
+
+    type B = NdArray;
+
+    fn device() -> <B as Backend>::Device {
+        Default::default()
+    }
+
+    #[test]
+    fn cache_initial_state() {
+        let cache = KvCache::<B>::new(1, 2, 8, 4, &device());
+        assert_eq!(cache.len(), 0);
+    }
+
+    #[test]
+    fn cache_single_append() {
+        let dev = device();
+        let mut cache = KvCache::<B>::new(1, 2, 8, 4, &dev);
+        let tensor = Tensor::<B, 4>::ones([1, 2, 3, 4], &dev);
+        let out = cache.forward(tensor);
+        assert_eq!(cache.len(), 3);
+        assert_eq!(out.dims(), [1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn cache_multiple_appends() {
+        let dev = device();
+        let mut cache = KvCache::<B>::new(1, 2, 16, 4, &dev);
+
+        // Append 3 tokens
+        let t1 = Tensor::<B, 4>::ones([1, 2, 3, 4], &dev);
+        let out1 = cache.forward(t1);
+        assert_eq!(cache.len(), 3);
+        assert_eq!(out1.dims(), [1, 2, 3, 4]);
+
+        // Append 2 more tokens
+        let t2 = Tensor::<B, 4>::ones([1, 2, 2, 4], &dev) * 2.0;
+        let out2 = cache.forward(t2);
+        assert_eq!(cache.len(), 5);
+        assert_eq!(out2.dims(), [1, 2, 5, 4]);
+    }
+
+    #[test]
+    fn cache_preserves_values() {
+        let dev = device();
+        let mut cache = KvCache::<B>::new(1, 1, 8, 2, &dev);
+
+        // Append [1.0, 2.0]
+        let t1 = Tensor::<B, 4>::from_floats([[[[1.0, 2.0]]]], &dev);
+        cache.forward(t1);
+
+        // Append [3.0, 4.0]
+        let t2 = Tensor::<B, 4>::from_floats([[[[3.0, 4.0]]]], &dev);
+        let out = cache.forward(t2);
+
+        assert_eq!(cache.len(), 2);
+        let vals: Vec<f32> = out.to_data().iter::<f32>().collect();
+        assert_eq!(vals, vec![1.0, 2.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn cache_reset() {
+        let dev = device();
+        let mut cache = KvCache::<B>::new(1, 2, 8, 4, &dev);
+        let tensor = Tensor::<B, 4>::ones([1, 2, 3, 4], &dev);
+        cache.forward(tensor);
+        assert_eq!(cache.len(), 3);
+
+        cache.reset();
+        assert_eq!(cache.len(), 0);
+    }
+
+    #[test]
+    fn cache_sliding_window() {
+        let dev = device();
+        let mut cache = KvCache::<B>::new(1, 1, 4, 2, &dev); // max_seq_len=4
+
+        // Fill to capacity: 4 tokens
+        let t =
+            Tensor::<B, 4>::from_floats([[[[1.0, 0.0], [2.0, 0.0], [3.0, 0.0], [4.0, 0.0]]]], &dev);
+        let out = cache.forward(t);
+        assert_eq!(cache.len(), 4);
+        assert_eq!(out.dims(), [1, 1, 4, 2]);
+
+        // Append 1 more: should trigger sliding window
+        let t = Tensor::<B, 4>::from_floats([[[[5.0, 0.0]]]], &dev);
+        let out = cache.forward(t);
+        assert_eq!(cache.len(), 4); // still max_seq_len
+        assert_eq!(out.dims(), [1, 1, 4, 2]);
+
+        // Values should be [2,3,4,5] (oldest dropped)
+        let vals: Vec<f32> = out.to_data().iter::<f32>().collect();
+        assert_eq!(vals[0], 2.0); // first token's first element
+        assert_eq!(vals[2], 3.0);
+        assert_eq!(vals[4], 4.0);
+        assert_eq!(vals[6], 5.0);
     }
 }

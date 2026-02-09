@@ -86,6 +86,14 @@ Both dense and Mixture of Experts (MoE) Qwen3 models are supported. Preset confi
 
 MoE models use 128 experts with top-8 routing per token. The model directory must contain `config.json`, `tokenizer.json`, and `*.safetensors`.
 
+## Testing
+
+```bash
+cargo test            # 47 unit tests, no GPU or model weights needed
+cargo fmt -- --check  # formatting
+cargo clippy --all-targets  # lints (example warnings are expected without a backend feature)
+```
+
 ## Backends
 
 | Feature | Backend | Notes |

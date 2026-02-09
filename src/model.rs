@@ -87,7 +87,7 @@ impl Qwen3Config {
         if step == 0 {
             return false;
         }
-        layer_idx % step == 0
+        layer_idx.is_multiple_of(step)
     }
 
     /// Qwen3-0.6B configuration.
@@ -344,13 +344,9 @@ impl<B: Backend> Qwen3<B> {
 
         let seq_len = tokens.len();
         let mask = build_causal_mask::<B>(seq_len, seq_len, &self.device);
-        let logits = self.transformer.forward(
-            token_tensor,
-            &self.rope,
-            Some(mask),
-            &mut self.caches,
-            0,
-        );
+        let logits =
+            self.transformer
+                .forward(token_tensor, &self.rope, Some(mask), &mut self.caches, 0);
 
         // Sample next token from last position's logits
         let last_logits = logits
@@ -373,8 +369,7 @@ impl<B: Backend> Qwen3<B> {
         let mut pos = seq_len;
         for _ in 1..max_new_tokens {
             let td = TensorData::new(vec![next_token as i32], [1]);
-            let token_tensor =
-                Tensor::<B, 1, Int>::from_data(td, &self.device).unsqueeze::<2>();
+            let token_tensor = Tensor::<B, 1, Int>::from_data(td, &self.device).unsqueeze::<2>();
 
             let total_len = pos + 1;
             let mask = build_causal_mask::<B>(1, total_len, &self.device);
@@ -407,11 +402,7 @@ impl<B: Backend> Qwen3<B> {
 }
 
 /// Apply temperature scaling and sample a token.
-fn sample_token<B: Backend>(
-    logits: &Tensor<B, 2>,
-    temperature: f64,
-    sampler: &mut Sampler,
-) -> u32 {
+fn sample_token<B: Backend>(logits: &Tensor<B, 2>, temperature: f64, sampler: &mut Sampler) -> u32 {
     let logits = if temperature > 0.0 {
         let scaled = logits.clone() / temperature;
         activation::softmax(scaled, 1)
@@ -437,7 +428,7 @@ fn load_safetensors_weights<B: Backend>(
     for entry in std::fs::read_dir(model_dir)? {
         let entry = entry?;
         let path = entry.path();
-        if path.extension().map_or(false, |ext| ext == "safetensors") {
+        if path.extension().is_some_and(|ext| ext == "safetensors") {
             st_files.push(path);
         }
     }
@@ -468,26 +459,21 @@ fn load_safetensors_weights<B: Backend>(
             let data = tensor_view.data();
 
             let float_data: Vec<f32> = match dtype {
-                safetensors::Dtype::F32 => {
-                    data.chunks_exact(4)
-                        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-                        .collect()
+                safetensors::Dtype::F32 => data
+                    .chunks_exact(4)
+                    .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                    .collect(),
+                safetensors::Dtype::F16 => data
+                    .chunks_exact(2)
+                    .map(|chunk| half::f16::from_le_bytes([chunk[0], chunk[1]]).to_f32())
+                    .collect(),
+                safetensors::Dtype::BF16 => data
+                    .chunks_exact(2)
+                    .map(|chunk| half::bf16::from_le_bytes([chunk[0], chunk[1]]).to_f32())
+                    .collect(),
+                _ => {
+                    return Err(format!("Unsupported dtype {:?} for tensor {}", dtype, name).into())
                 }
-                safetensors::Dtype::F16 => {
-                    data.chunks_exact(2)
-                        .map(|chunk| {
-                            half::f16::from_le_bytes([chunk[0], chunk[1]]).to_f32()
-                        })
-                        .collect()
-                }
-                safetensors::Dtype::BF16 => {
-                    data.chunks_exact(2)
-                        .map(|chunk| {
-                            half::bf16::from_le_bytes([chunk[0], chunk[1]]).to_f32()
-                        })
-                        .collect()
-                }
-                _ => return Err(format!("Unsupported dtype {:?} for tensor {}", dtype, name).into()),
             };
 
             tensor_map.insert(name.to_string(), (float_data, shape));
@@ -508,7 +494,13 @@ fn load_safetensors_weights<B: Backend>(
         let (data, shape) = tensor_map
             .get(name)
             .ok_or_else(|| format!("Tensor '{}' not found in safetensors", name))?;
-        assert_eq!(shape.len(), 2, "Expected 2D tensor for {}, got {:?}", name, shape);
+        assert_eq!(
+            shape.len(),
+            2,
+            "Expected 2D tensor for {}, got {:?}",
+            name,
+            shape
+        );
         let td = TensorData::new(data.clone(), [shape[0], shape[1]]);
         Ok(Tensor::from_data(td, device))
     };
@@ -525,7 +517,13 @@ fn load_safetensors_weights<B: Backend>(
         let (data, shape) = tensor_map
             .get(name)
             .ok_or_else(|| format!("Tensor '{}' not found in safetensors", name))?;
-        assert_eq!(shape.len(), 3, "Expected 3D tensor for {}, got {:?}", name, shape);
+        assert_eq!(
+            shape.len(),
+            3,
+            "Expected 3D tensor for {}, got {:?}",
+            name,
+            shape
+        );
         let td = TensorData::new(data.clone(), [shape[0], shape[1], shape[2]]);
         Ok(Tensor::from_data(td, device))
     };
@@ -576,10 +574,17 @@ fn load_safetensors_weights<B: Backend>(
 
             transformer = transformer.load_moe_layer(
                 i,
-                q_proj_w, k_proj_w, v_proj_w, o_proj_w,
-                q_norm_w, k_norm_w,
-                gate_up_proj, down_proj, router_weight,
-                input_ln_w, post_attn_ln_w,
+                q_proj_w,
+                k_proj_w,
+                v_proj_w,
+                o_proj_w,
+                q_norm_w,
+                k_norm_w,
+                gate_up_proj,
+                down_proj,
+                router_weight,
+                input_ln_w,
+                post_attn_ln_w,
             );
         } else {
             // Dense layer: load individual MLP weights
@@ -589,10 +594,17 @@ fn load_safetensors_weights<B: Backend>(
 
             transformer = transformer.load_layer(
                 i,
-                q_proj_w, k_proj_w, v_proj_w, o_proj_w,
-                q_norm_w, k_norm_w,
-                gate_proj_w, up_proj_w, down_proj_w,
-                input_ln_w, post_attn_ln_w,
+                q_proj_w,
+                k_proj_w,
+                v_proj_w,
+                o_proj_w,
+                q_norm_w,
+                k_norm_w,
+                gate_proj_w,
+                up_proj_w,
+                down_proj_w,
+                input_ln_w,
+                post_attn_ln_w,
             );
         }
     }
@@ -618,4 +630,143 @@ fn load_safetensors_weights<B: Backend>(
 
     eprintln!("Model loaded successfully.");
     Ok(transformer)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dense_config_is_not_moe() {
+        let config = Qwen3Config::qwen3_0_6b();
+        assert!(!config.is_moe());
+        assert!(!config.is_moe_layer(0));
+        assert!(!config.is_moe_layer(10));
+    }
+
+    #[test]
+    fn moe_config_is_moe() {
+        let config = Qwen3Config::qwen3_30b_a3b();
+        assert!(config.is_moe());
+    }
+
+    #[test]
+    fn moe_every_layer_when_step_is_1() {
+        let config = Qwen3Config::qwen3_30b_a3b();
+        assert_eq!(config.decoder_sparse_step, Some(1));
+        for i in 0..config.num_hidden_layers {
+            assert!(config.is_moe_layer(i), "layer {} should be MoE", i);
+        }
+    }
+
+    #[test]
+    fn moe_layer_respects_mlp_only_layers() {
+        let mut config = Qwen3Config::qwen3_30b_a3b();
+        config.mlp_only_layers = Some(vec![0, 5, 10]);
+        assert!(!config.is_moe_layer(0));
+        assert!(config.is_moe_layer(1));
+        assert!(!config.is_moe_layer(5));
+        assert!(!config.is_moe_layer(10));
+        assert!(config.is_moe_layer(11));
+    }
+
+    #[test]
+    fn moe_layer_with_sparse_step_2() {
+        let mut config = Qwen3Config::qwen3_30b_a3b();
+        config.decoder_sparse_step = Some(2);
+        // step=2: layers 0, 2, 4 are MoE; layers 1, 3, 5 are dense
+        assert!(config.is_moe_layer(0));
+        assert!(!config.is_moe_layer(1));
+        assert!(config.is_moe_layer(2));
+        assert!(!config.is_moe_layer(3));
+    }
+
+    #[test]
+    fn moe_layer_step_0_means_no_moe() {
+        let mut config = Qwen3Config::qwen3_30b_a3b();
+        config.decoder_sparse_step = Some(0);
+        for i in 0..config.num_hidden_layers {
+            assert!(!config.is_moe_layer(i));
+        }
+    }
+
+    #[test]
+    fn serde_dense_config() {
+        let json = r#"{
+            "hidden_size": 1024,
+            "num_hidden_layers": 28,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 8,
+            "intermediate_size": 3072,
+            "vocab_size": 151936,
+            "max_position_embeddings": 40960
+        }"#;
+        let config: Qwen3Config = serde_json::from_str(json).unwrap();
+        assert_eq!(config.hidden_size, 1024);
+        assert_eq!(config.num_hidden_layers, 28);
+        assert!(!config.is_moe());
+        // Defaults
+        assert_eq!(config.rms_norm_eps, 1e-6);
+        assert_eq!(config.rope_theta, 1_000_000.0);
+        assert_eq!(config.head_dim, 128);
+        assert!(!config.tie_word_embeddings);
+        assert_eq!(config.num_experts, None);
+    }
+
+    #[test]
+    fn serde_moe_config() {
+        let json = r#"{
+            "hidden_size": 2048,
+            "num_hidden_layers": 48,
+            "num_attention_heads": 32,
+            "num_key_value_heads": 4,
+            "intermediate_size": 768,
+            "vocab_size": 151936,
+            "max_position_embeddings": 40960,
+            "num_experts": 128,
+            "num_experts_per_tok": 8,
+            "moe_intermediate_size": 768,
+            "decoder_sparse_step": 1,
+            "norm_topk_prob": true,
+            "mlp_only_layers": []
+        }"#;
+        let config: Qwen3Config = serde_json::from_str(json).unwrap();
+        assert!(config.is_moe());
+        assert_eq!(config.num_experts, Some(128));
+        assert_eq!(config.num_experts_per_tok, Some(8));
+        assert_eq!(config.moe_intermediate_size, Some(768));
+        assert_eq!(config.norm_topk_prob, Some(true));
+        assert_eq!(config.mlp_only_layers, Some(vec![]));
+    }
+
+    #[test]
+    fn preset_dense_configs() {
+        let c = Qwen3Config::qwen3_0_6b();
+        assert_eq!(c.hidden_size, 1024);
+        assert_eq!(c.num_hidden_layers, 28);
+        assert!(c.tie_word_embeddings);
+        assert!(!c.is_moe());
+
+        let c = Qwen3Config::qwen3_8b();
+        assert_eq!(c.hidden_size, 4096);
+        assert_eq!(c.num_hidden_layers, 36);
+        assert!(!c.tie_word_embeddings);
+        assert!(!c.is_moe());
+    }
+
+    #[test]
+    fn preset_moe_configs() {
+        let c = Qwen3Config::qwen3_30b_a3b();
+        assert_eq!(c.hidden_size, 2048);
+        assert_eq!(c.num_hidden_layers, 48);
+        assert_eq!(c.num_experts, Some(128));
+        assert_eq!(c.num_experts_per_tok, Some(8));
+        assert!(c.is_moe());
+
+        let c = Qwen3Config::qwen3_235b_a22b();
+        assert_eq!(c.hidden_size, 4096);
+        assert_eq!(c.num_hidden_layers, 94);
+        assert_eq!(c.num_experts, Some(128));
+        assert!(c.is_moe());
+    }
 }
