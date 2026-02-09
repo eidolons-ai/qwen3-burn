@@ -2,6 +2,7 @@ use burn::module::Param;
 use burn::nn::Embedding;
 use burn::prelude::*;
 use burn::tensor::activation;
+use burn::tensor::IndexingUpdateOp;
 
 use crate::cache::KvCache;
 
@@ -298,13 +299,187 @@ impl<B: Backend> FeedForward<B> {
     }
 }
 
+/// Mixture of Experts layer.
+///
+/// Uses packed expert weights: a router selects top-k experts per token,
+/// then each expert applies SwiGLU independently.
+#[derive(Module, Debug)]
+pub struct MoeLayer<B: Backend> {
+    /// Router weight: [num_experts, hidden_size]
+    router_weight: Param<Tensor<B, 2>>,
+    /// Packed gate+up projection: [num_experts, hidden_size, 2*moe_intermediate_size]
+    /// Stored in Burn convention [in, out] per expert.
+    gate_up_proj: Param<Tensor<B, 3>>,
+    /// Packed down projection: [num_experts, moe_intermediate_size, hidden_size]
+    /// Stored in Burn convention [in, out] per expert.
+    down_proj: Param<Tensor<B, 3>>,
+    num_experts: usize,
+    num_experts_per_tok: usize,
+    moe_intermediate_size: usize,
+    norm_topk_prob: bool,
+}
+
+impl<B: Backend> MoeLayer<B> {
+    pub fn new(
+        d_model: usize,
+        num_experts: usize,
+        num_experts_per_tok: usize,
+        moe_intermediate_size: usize,
+        norm_topk_prob: bool,
+        device: &Device<B>,
+    ) -> Self {
+        Self {
+            router_weight: Param::from_tensor(Tensor::zeros(
+                [num_experts, d_model],
+                device,
+            )),
+            gate_up_proj: Param::from_tensor(Tensor::zeros(
+                [num_experts, d_model, 2 * moe_intermediate_size],
+                device,
+            )),
+            down_proj: Param::from_tensor(Tensor::zeros(
+                [num_experts, moe_intermediate_size, d_model],
+                device,
+            )),
+            num_experts,
+            num_experts_per_tok,
+            moe_intermediate_size,
+            norm_topk_prob,
+        }
+    }
+
+    pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
+        let [batch, seq_len, hidden] = x.dims();
+        let num_tokens = batch * seq_len;
+
+        // Flatten to [num_tokens, hidden]
+        let x_flat = x.reshape([num_tokens, hidden]);
+
+        // Router logits: [num_tokens, hidden] @ [hidden, num_experts] -> [num_tokens, num_experts]
+        let router_logits = x_flat.clone().matmul(self.router_weight.val().transpose());
+        let router_probs = activation::softmax(router_logits, 1);
+
+        // Get top-k expert indices and weights
+        // topk returns (values, indices) with shape [num_tokens, k]
+        let (topk_weights, topk_indices) = router_probs.topk_with_indices(self.num_experts_per_tok, 1);
+
+        // Renormalize weights if configured
+        let topk_weights = if self.norm_topk_prob {
+            let sum = topk_weights.clone().sum_dim(1);
+            topk_weights / sum
+        } else {
+            topk_weights
+        };
+
+        // Process each expert: gather tokens, compute SwiGLU, scatter back
+        // Initialize output as zeros
+        let device = x_flat.device();
+        let mut output = Tensor::<B, 2>::zeros([num_tokens, hidden], &device);
+
+        // Convert topk_indices to data for CPU-side iteration over experts
+        let indices_data = topk_indices.to_data();
+        let indices_vec: Vec<i64> = indices_data.iter::<i64>().collect();
+        let weights_data = topk_weights.to_data();
+        let weights_vec: Vec<f32> = weights_data.iter::<f32>().collect();
+
+        // For each expert, find which (token, slot) pairs route to it
+        for expert_idx in 0..self.num_experts {
+            // Collect token indices that route to this expert
+            let mut token_indices = Vec::new();
+            let mut token_weights = Vec::new();
+
+            for token_idx in 0..num_tokens {
+                for slot in 0..self.num_experts_per_tok {
+                    let idx = token_idx * self.num_experts_per_tok + slot;
+                    if indices_vec[idx] == expert_idx as i64 {
+                        token_indices.push(token_idx);
+                        token_weights.push(weights_vec[idx]);
+                    }
+                }
+            }
+
+            if token_indices.is_empty() {
+                continue;
+            }
+
+            let n = token_indices.len();
+
+            // Gather tokens for this expert: [n, hidden]
+            let gather_indices: Vec<i32> = token_indices.iter().map(|&i| i as i32).collect();
+            let gather_tensor = Tensor::<B, 1, Int>::from_data(
+                burn::tensor::TensorData::new(gather_indices, [n]),
+                &device,
+            );
+            let expert_input = x_flat.clone().select(0, gather_tensor);
+
+            // Slice this expert's weights
+            // gate_up_proj: [num_experts, hidden, 2*moe_intermediate] -> [hidden, 2*moe_intermediate]
+            let expert_gate_up = self.gate_up_proj.val().slice([
+                expert_idx..expert_idx + 1,
+                0..hidden,
+                0..2 * self.moe_intermediate_size,
+            ]).reshape([hidden, 2 * self.moe_intermediate_size]);
+
+            // down_proj: [num_experts, moe_intermediate, hidden] -> [moe_intermediate, hidden]
+            let expert_down = self.down_proj.val().slice([
+                expert_idx..expert_idx + 1,
+                0..self.moe_intermediate_size,
+                0..hidden,
+            ]).reshape([self.moe_intermediate_size, hidden]);
+
+            // SwiGLU: split gate_up into gate and up
+            // expert_input @ expert_gate_up -> [n, 2*moe_intermediate]
+            let gate_up = expert_input.matmul(expert_gate_up);
+            let gate = gate_up.clone().slice([0..n, 0..self.moe_intermediate_size]);
+            let up = gate_up.slice([0..n, self.moe_intermediate_size..2 * self.moe_intermediate_size]);
+            let hidden_states = activation::silu(gate) * up;
+
+            // down_proj: [n, moe_intermediate] @ [moe_intermediate, hidden] -> [n, hidden]
+            let expert_output = hidden_states.matmul(expert_down);
+
+            // Weight the expert output and scatter back
+            let weight_tensor = Tensor::<B, 1>::from_floats(token_weights.as_slice(), &device)
+                .unsqueeze_dim::<2>(1);
+            let weighted_output = expert_output * weight_tensor;
+
+            // Scatter add: for each token in this expert batch, add to output
+            let scatter_indices: Vec<i32> = token_indices.iter().map(|&i| i as i32).collect();
+            let scatter_tensor = Tensor::<B, 1, Int>::from_data(
+                burn::tensor::TensorData::new(scatter_indices, [n]),
+                &device,
+            );
+            // Expand scatter indices to [n, hidden] for scatter_along_dim
+            let scatter_2d = scatter_tensor.unsqueeze_dim::<2>(1).expand([n, hidden]);
+            output = output.scatter(0, scatter_2d, weighted_output, IndexingUpdateOp::Add);
+        }
+
+        output.reshape([batch, seq_len, hidden])
+    }
+}
+
+/// MLP variant: either a dense FeedForward or a Mixture of Experts layer.
+#[derive(Module, Debug)]
+pub enum Mlp<B: Backend> {
+    Dense(FeedForward<B>),
+    Moe(MoeLayer<B>),
+}
+
+impl<B: Backend> Mlp<B> {
+    pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
+        match self {
+            Mlp::Dense(ff) => ff.forward(x),
+            Mlp::Moe(moe) => moe.forward(x),
+        }
+    }
+}
+
 /// Single transformer decoder block.
 #[derive(Module, Debug)]
 pub struct TransformerBlock<B: Backend> {
     input_layernorm: RmsNorm<B>,
     self_attn: MultiHeadAttention<B>,
     post_attention_layernorm: RmsNorm<B>,
-    mlp: FeedForward<B>,
+    mlp: Mlp<B>,
 }
 
 impl<B: Backend> TransformerBlock<B> {
@@ -328,7 +503,41 @@ impl<B: Backend> TransformerBlock<B> {
                 device,
             ),
             post_attention_layernorm: RmsNorm::new(d_model, rms_norm_eps, device),
-            mlp: FeedForward::new(d_model, intermediate_size, device),
+            mlp: Mlp::Dense(FeedForward::new(d_model, intermediate_size, device)),
+        }
+    }
+
+    pub fn new_moe(
+        d_model: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        num_experts: usize,
+        num_experts_per_tok: usize,
+        moe_intermediate_size: usize,
+        norm_topk_prob: bool,
+        rms_norm_eps: f64,
+        device: &Device<B>,
+    ) -> Self {
+        Self {
+            input_layernorm: RmsNorm::new(d_model, rms_norm_eps, device),
+            self_attn: MultiHeadAttention::new(
+                d_model,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                rms_norm_eps,
+                device,
+            ),
+            post_attention_layernorm: RmsNorm::new(d_model, rms_norm_eps, device),
+            mlp: Mlp::Moe(MoeLayer::new(
+                d_model,
+                num_experts,
+                num_experts_per_tok,
+                moe_intermediate_size,
+                norm_topk_prob,
+                device,
+            )),
         }
     }
 
@@ -363,6 +572,18 @@ pub struct Transformer<B: Backend> {
     lm_head: nn::Linear<B>,
 }
 
+/// MoE configuration passed to Transformer::new when building MoE models.
+pub struct MoeConfig {
+    pub num_experts: usize,
+    pub num_experts_per_tok: usize,
+    pub moe_intermediate_size: usize,
+    pub norm_topk_prob: bool,
+    /// Layers that are dense-only despite being an MoE model.
+    pub mlp_only_layers: Vec<usize>,
+    /// MoE is applied every `decoder_sparse_step` layers.
+    pub decoder_sparse_step: usize,
+}
+
 impl<B: Backend> Transformer<B> {
     pub fn new(
         vocab_size: usize,
@@ -373,37 +594,54 @@ impl<B: Backend> Transformer<B> {
         head_dim: usize,
         intermediate_size: usize,
         rms_norm_eps: f64,
-        tie_word_embeddings: bool,
+        _tie_word_embeddings: bool,
+        moe_config: Option<&MoeConfig>,
         device: &Device<B>,
     ) -> Self {
         let embed_tokens = nn::EmbeddingConfig::new(vocab_size, d_model).init(device);
 
         let layers = (0..num_layers)
-            .map(|_| {
-                TransformerBlock::new(
-                    d_model,
-                    num_heads,
-                    num_kv_heads,
-                    head_dim,
-                    intermediate_size,
-                    rms_norm_eps,
-                    device,
-                )
+            .map(|i| {
+                let use_moe = if let Some(moe) = moe_config {
+                    let step = moe.decoder_sparse_step;
+                    step > 0 && i % step == 0 && !moe.mlp_only_layers.contains(&i)
+                } else {
+                    false
+                };
+
+                if use_moe {
+                    let moe = moe_config.unwrap();
+                    TransformerBlock::new_moe(
+                        d_model,
+                        num_heads,
+                        num_kv_heads,
+                        head_dim,
+                        moe.num_experts,
+                        moe.num_experts_per_tok,
+                        moe.moe_intermediate_size,
+                        moe.norm_topk_prob,
+                        rms_norm_eps,
+                        device,
+                    )
+                } else {
+                    TransformerBlock::new(
+                        d_model,
+                        num_heads,
+                        num_kv_heads,
+                        head_dim,
+                        intermediate_size,
+                        rms_norm_eps,
+                        device,
+                    )
+                }
             })
             .collect();
 
         let norm = RmsNorm::new(d_model, rms_norm_eps, device);
 
-        let lm_head = if tie_word_embeddings {
-            // Will be overwritten with embed_tokens weight during loading
-            nn::LinearConfig::new(d_model, vocab_size)
-                .with_bias(false)
-                .init(device)
-        } else {
-            nn::LinearConfig::new(d_model, vocab_size)
-                .with_bias(false)
-                .init(device)
-        };
+        let lm_head = nn::LinearConfig::new(d_model, vocab_size)
+            .with_bias(false)
+            .init(device);
 
         Self {
             embed_tokens,
@@ -485,10 +723,65 @@ impl<B: Backend> Transformer<B> {
         layer.self_attn.q_norm.weight = Param::from_tensor(q_norm_w);
         layer.self_attn.k_norm.weight = Param::from_tensor(k_norm_w);
 
-        // MLP
-        layer.mlp.gate_proj.weight = Param::from_tensor(gate_proj_w);
-        layer.mlp.up_proj.weight = Param::from_tensor(up_proj_w);
-        layer.mlp.down_proj.weight = Param::from_tensor(down_proj_w);
+        // MLP (dense)
+        match &mut layer.mlp {
+            Mlp::Dense(ff) => {
+                ff.gate_proj.weight = Param::from_tensor(gate_proj_w);
+                ff.up_proj.weight = Param::from_tensor(up_proj_w);
+                ff.down_proj.weight = Param::from_tensor(down_proj_w);
+            }
+            Mlp::Moe(_) => panic!("load_layer called on MoE layer {}", layer_idx),
+        }
+
+        // Layer norms
+        layer.input_layernorm.weight = Param::from_tensor(input_ln_w);
+        layer.post_attention_layernorm.weight = Param::from_tensor(post_attn_ln_w);
+
+        self
+    }
+
+    /// Load weights for a MoE layer.
+    ///
+    /// - `gate_up_proj`: packed expert weights [num_experts, hidden, 2*moe_intermediate] (already transposed)
+    /// - `down_proj`: expert weights [num_experts, moe_intermediate, hidden] (already transposed)
+    /// - `router_weight`: [num_experts, hidden]
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_moe_layer(
+        mut self,
+        layer_idx: usize,
+        q_proj_w: Tensor<B, 2>,
+        k_proj_w: Tensor<B, 2>,
+        v_proj_w: Tensor<B, 2>,
+        o_proj_w: Tensor<B, 2>,
+        q_norm_w: Tensor<B, 1>,
+        k_norm_w: Tensor<B, 1>,
+        gate_up_proj: Tensor<B, 3>,
+        down_proj: Tensor<B, 3>,
+        router_weight: Tensor<B, 2>,
+        input_ln_w: Tensor<B, 1>,
+        post_attn_ln_w: Tensor<B, 1>,
+    ) -> Self {
+        let layer = &mut self.layers[layer_idx];
+
+        // Attention projections
+        layer.self_attn.q_proj.weight = Param::from_tensor(q_proj_w);
+        layer.self_attn.k_proj.weight = Param::from_tensor(k_proj_w);
+        layer.self_attn.v_proj.weight = Param::from_tensor(v_proj_w);
+        layer.self_attn.o_proj.weight = Param::from_tensor(o_proj_w);
+
+        // QK-Norm
+        layer.self_attn.q_norm.weight = Param::from_tensor(q_norm_w);
+        layer.self_attn.k_norm.weight = Param::from_tensor(k_norm_w);
+
+        // MoE weights
+        match &mut layer.mlp {
+            Mlp::Moe(moe) => {
+                moe.gate_up_proj = Param::from_tensor(gate_up_proj);
+                moe.down_proj = Param::from_tensor(down_proj);
+                moe.router_weight = Param::from_tensor(router_weight);
+            }
+            Mlp::Dense(_) => panic!("load_moe_layer called on dense layer {}", layer_idx),
+        }
 
         // Layer norms
         layer.input_layernorm.weight = Param::from_tensor(input_ln_w);

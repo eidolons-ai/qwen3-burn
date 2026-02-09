@@ -10,7 +10,7 @@ use serde::Deserialize;
 use crate::sampling::Sampler;
 use crate::tokenizer::Qwen3Tokenizer;
 use crate::transformer::{
-    build_causal_mask, AttentionKvCache, RotaryEmbedding, Transformer,
+    build_causal_mask, AttentionKvCache, MoeConfig, RotaryEmbedding, Transformer,
 };
 
 /// Qwen3 model configuration matching HuggingFace `config.json`.
@@ -31,6 +31,19 @@ pub struct Qwen3Config {
     pub head_dim: usize,
     #[serde(default)]
     pub tie_word_embeddings: bool,
+    // MoE fields (None for dense models)
+    #[serde(default)]
+    pub num_experts: Option<usize>,
+    #[serde(default)]
+    pub num_experts_per_tok: Option<usize>,
+    #[serde(default)]
+    pub moe_intermediate_size: Option<usize>,
+    #[serde(default)]
+    pub decoder_sparse_step: Option<usize>,
+    #[serde(default)]
+    pub norm_topk_prob: Option<bool>,
+    #[serde(default)]
+    pub mlp_only_layers: Option<Vec<usize>>,
 }
 
 fn default_rms_norm_eps() -> f64 {
@@ -51,6 +64,32 @@ impl Qwen3Config {
         Ok(config)
     }
 
+    /// Returns true if this is a Mixture of Experts model.
+    pub fn is_moe(&self) -> bool {
+        self.num_experts.unwrap_or(0) > 1
+    }
+
+    /// Returns whether a given layer index uses MoE (vs dense FFN).
+    /// MoE layers are determined by `decoder_sparse_step` (every N-th layer is MoE)
+    /// and `mlp_only_layers` (explicit dense-only overrides).
+    pub fn is_moe_layer(&self, layer_idx: usize) -> bool {
+        if !self.is_moe() {
+            return false;
+        }
+        // Check if this layer is in the dense-only override list
+        if let Some(ref dense_layers) = self.mlp_only_layers {
+            if dense_layers.contains(&layer_idx) {
+                return false;
+            }
+        }
+        // decoder_sparse_step=1 means every layer is MoE
+        let step = self.decoder_sparse_step.unwrap_or(1);
+        if step == 0 {
+            return false;
+        }
+        layer_idx % step == 0
+    }
+
     /// Qwen3-0.6B configuration.
     pub fn qwen3_0_6b() -> Self {
         Self {
@@ -65,6 +104,12 @@ impl Qwen3Config {
             rope_theta: 1_000_000.0,
             head_dim: 128,
             tie_word_embeddings: true,
+            num_experts: None,
+            num_experts_per_tok: None,
+            moe_intermediate_size: None,
+            decoder_sparse_step: None,
+            norm_topk_prob: None,
+            mlp_only_layers: None,
         }
     }
 
@@ -82,6 +127,12 @@ impl Qwen3Config {
             rope_theta: 1_000_000.0,
             head_dim: 128,
             tie_word_embeddings: true,
+            num_experts: None,
+            num_experts_per_tok: None,
+            moe_intermediate_size: None,
+            decoder_sparse_step: None,
+            norm_topk_prob: None,
+            mlp_only_layers: None,
         }
     }
 
@@ -99,6 +150,12 @@ impl Qwen3Config {
             rope_theta: 1_000_000.0,
             head_dim: 128,
             tie_word_embeddings: true,
+            num_experts: None,
+            num_experts_per_tok: None,
+            moe_intermediate_size: None,
+            decoder_sparse_step: None,
+            norm_topk_prob: None,
+            mlp_only_layers: None,
         }
     }
 
@@ -116,6 +173,58 @@ impl Qwen3Config {
             rope_theta: 1_000_000.0,
             head_dim: 128,
             tie_word_embeddings: false,
+            num_experts: None,
+            num_experts_per_tok: None,
+            moe_intermediate_size: None,
+            decoder_sparse_step: None,
+            norm_topk_prob: None,
+            mlp_only_layers: None,
+        }
+    }
+
+    /// Qwen3-30B-A3B (MoE) configuration.
+    pub fn qwen3_30b_a3b() -> Self {
+        Self {
+            hidden_size: 2048,
+            num_hidden_layers: 48,
+            num_attention_heads: 32,
+            num_key_value_heads: 4,
+            intermediate_size: 768, // dense intermediate (not used for MoE layers)
+            vocab_size: 151936,
+            max_position_embeddings: 40960,
+            rms_norm_eps: 1e-6,
+            rope_theta: 1_000_000.0,
+            head_dim: 128,
+            tie_word_embeddings: true,
+            num_experts: Some(128),
+            num_experts_per_tok: Some(8),
+            moe_intermediate_size: Some(768),
+            decoder_sparse_step: Some(1),
+            norm_topk_prob: Some(true),
+            mlp_only_layers: Some(vec![]),
+        }
+    }
+
+    /// Qwen3-235B-A22B (MoE) configuration.
+    pub fn qwen3_235b_a22b() -> Self {
+        Self {
+            hidden_size: 4096,
+            num_hidden_layers: 94,
+            num_attention_heads: 64,
+            num_key_value_heads: 4,
+            intermediate_size: 1536, // dense intermediate (not used for MoE layers)
+            vocab_size: 152064,
+            max_position_embeddings: 40960,
+            rms_norm_eps: 1e-6,
+            rope_theta: 1_000_000.0,
+            head_dim: 128,
+            tie_word_embeddings: false,
+            num_experts: Some(128),
+            num_experts_per_tok: Some(8),
+            moe_intermediate_size: Some(1536),
+            decoder_sparse_step: Some(1),
+            norm_topk_prob: Some(true),
+            mlp_only_layers: Some(vec![]),
         }
     }
 }
@@ -148,6 +257,20 @@ impl<B: Backend> Qwen3<B> {
         // Load config
         let config = Qwen3Config::from_file(model_dir.join("config.json"))?;
 
+        // Build MoE config if this is a MoE model
+        let moe_config = if config.is_moe() {
+            Some(MoeConfig {
+                num_experts: config.num_experts.unwrap(),
+                num_experts_per_tok: config.num_experts_per_tok.unwrap(),
+                moe_intermediate_size: config.moe_intermediate_size.unwrap(),
+                norm_topk_prob: config.norm_topk_prob.unwrap_or(true),
+                mlp_only_layers: config.mlp_only_layers.clone().unwrap_or_default(),
+                decoder_sparse_step: config.decoder_sparse_step.unwrap_or(1),
+            })
+        } else {
+            None
+        };
+
         // Create model
         let transformer = Transformer::new(
             config.vocab_size,
@@ -159,6 +282,7 @@ impl<B: Backend> Qwen3<B> {
             config.intermediate_size,
             config.rms_norm_eps,
             config.tie_word_embeddings,
+            moe_config.as_ref(),
             device,
         );
 
@@ -396,6 +520,24 @@ fn load_safetensors_weights<B: Backend>(
         Ok(get_tensor_2d_raw(name)?.transpose())
     };
 
+    // Helper to get a raw 3D tensor (for packed expert weights).
+    let get_tensor_3d_raw = |name: &str| -> Result<Tensor<B, 3>, Box<dyn std::error::Error>> {
+        let (data, shape) = tensor_map
+            .get(name)
+            .ok_or_else(|| format!("Tensor '{}' not found in safetensors", name))?;
+        assert_eq!(shape.len(), 3, "Expected 3D tensor for {}, got {:?}", name, shape);
+        let td = TensorData::new(data.clone(), [shape[0], shape[1], shape[2]]);
+        Ok(Tensor::from_data(td, device))
+    };
+
+    // Helper to get a 3D expert weight tensor and transpose the per-expert matrices.
+    // PyTorch stores as [num_experts, out, in], Burn needs [num_experts, in, out].
+    let get_expert_weight = |name: &str| -> Result<Tensor<B, 3>, Box<dyn std::error::Error>> {
+        let raw = get_tensor_3d_raw(name)?;
+        // Swap dims 1 and 2 to transpose each expert's weight matrix
+        Ok(raw.swap_dims(1, 2))
+    };
+
     // Load embedding weights (no transpose needed for embeddings)
     eprintln!("Loading embedding weights...");
     let embed_weight = get_tensor_2d_raw("model.embed_tokens.weight")?;
@@ -419,22 +561,40 @@ fn load_safetensors_weights<B: Backend>(
         let q_norm_w = get_tensor_1d(&format!("{}.self_attn.q_norm.weight", prefix))?;
         let k_norm_w = get_tensor_1d(&format!("{}.self_attn.k_norm.weight", prefix))?;
 
-        // MLP weights (transpose for Burn's Linear convention)
-        let gate_proj_w = get_linear_weight(&format!("{}.mlp.gate_proj.weight", prefix))?;
-        let up_proj_w = get_linear_weight(&format!("{}.mlp.up_proj.weight", prefix))?;
-        let down_proj_w = get_linear_weight(&format!("{}.mlp.down_proj.weight", prefix))?;
-
         // Layer norm weights
         let input_ln_w = get_tensor_1d(&format!("{}.input_layernorm.weight", prefix))?;
         let post_attn_ln_w = get_tensor_1d(&format!("{}.post_attention_layernorm.weight", prefix))?;
 
-        transformer = transformer.load_layer(
-            i,
-            q_proj_w, k_proj_w, v_proj_w, o_proj_w,
-            q_norm_w, k_norm_w,
-            gate_proj_w, up_proj_w, down_proj_w,
-            input_ln_w, post_attn_ln_w,
-        );
+        if config.is_moe_layer(i) {
+            // MoE layer: load packed expert weights + router
+            // gate_up_proj: [num_experts, 2*moe_intermediate, hidden] -> transposed to [num_experts, hidden, 2*moe_intermediate]
+            let gate_up_proj = get_expert_weight(&format!("{}.mlp.experts.gate_up_proj", prefix))?;
+            // down_proj: [num_experts, hidden, moe_intermediate] -> transposed to [num_experts, moe_intermediate, hidden]
+            let down_proj = get_expert_weight(&format!("{}.mlp.experts.down_proj", prefix))?;
+            // router.weight: [num_experts, hidden] (no transpose needed, used as-is for matmul)
+            let router_weight = get_tensor_2d_raw(&format!("{}.mlp.router.weight", prefix))?;
+
+            transformer = transformer.load_moe_layer(
+                i,
+                q_proj_w, k_proj_w, v_proj_w, o_proj_w,
+                q_norm_w, k_norm_w,
+                gate_up_proj, down_proj, router_weight,
+                input_ln_w, post_attn_ln_w,
+            );
+        } else {
+            // Dense layer: load individual MLP weights
+            let gate_proj_w = get_linear_weight(&format!("{}.mlp.gate_proj.weight", prefix))?;
+            let up_proj_w = get_linear_weight(&format!("{}.mlp.up_proj.weight", prefix))?;
+            let down_proj_w = get_linear_weight(&format!("{}.mlp.down_proj.weight", prefix))?;
+
+            transformer = transformer.load_layer(
+                i,
+                q_proj_w, k_proj_w, v_proj_w, o_proj_w,
+                q_norm_w, k_norm_w,
+                gate_proj_w, up_proj_w, down_proj_w,
+                input_ln_w, post_attn_ln_w,
+            );
+        }
     }
 
     // Load final norm

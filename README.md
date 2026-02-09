@@ -73,16 +73,18 @@ println!("{}", output.text);
 
 ## Supported Models
 
-Any HuggingFace Qwen3 dense model works. Preset configs are provided for:
+Both dense and Mixture of Experts (MoE) Qwen3 models are supported. Preset configs are provided for:
 
-| Model | Params | `from_pretrained` repo |
-|-------|--------|----------------------|
-| Qwen3-0.6B | 0.6B | `Qwen/Qwen3-0.6B` |
-| Qwen3-1.7B | 1.7B | `Qwen/Qwen3-1.7B` |
-| Qwen3-4B | 4B | `Qwen/Qwen3-4B` |
-| Qwen3-8B | 8B | `Qwen/Qwen3-8B` |
+| Model | Params | Active Params | Type | `from_pretrained` repo |
+|-------|--------|---------------|------|----------------------|
+| Qwen3-0.6B | 0.6B | 0.6B | Dense | `Qwen/Qwen3-0.6B` |
+| Qwen3-1.7B | 1.7B | 1.7B | Dense | `Qwen/Qwen3-1.7B` |
+| Qwen3-4B | 4B | 4B | Dense | `Qwen/Qwen3-4B` |
+| Qwen3-8B | 8B | 8B | Dense | `Qwen/Qwen3-8B` |
+| Qwen3-30B-A3B | 30B | 3B | MoE | `Qwen/Qwen3-30B-A3B` |
+| Qwen3-235B-A22B | 235B | 22B | MoE | `Qwen/Qwen3-235B-A22B` |
 
-The model directory must contain `config.json`, `tokenizer.json`, and `*.safetensors`.
+MoE models use 128 experts with top-8 routing per token. The model directory must contain `config.json`, `tokenizer.json`, and `*.safetensors`.
 
 ## Backends
 

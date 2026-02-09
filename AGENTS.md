@@ -8,13 +8,14 @@ qwen3-burn is a Rust library implementing Qwen3 LLM inference using the Burn 0.2
 
 Qwen3 is a decoder-only transformer with these distinguishing features vs Llama:
 - **QK-Norm**: RMSNorm applied to Q and K projections *before* RoPE (unique to Qwen3)
-- **GQA**: Grouped-query attention with consistently 8 KV heads across all model sizes
+- **GQA**: Grouped-query attention with consistently 8 KV heads (dense) or 4 KV heads (MoE) across model sizes
 - **SwiGLU**: `down_proj(silu(gate_proj(x)) * up_proj(x))`
 - **RoPE**: theta=1,000,000, head_dim=128
 - **RMSNorm**: eps=1e-6 (Llama uses 1e-5)
 - **No bias** in any linear layers
-- **vocab_size**: 151,936
-- **tie_word_embeddings**: true for <=4B, false for >=8B
+- **vocab_size**: 151,936 (dense) or 152,064 (235B MoE)
+- **tie_word_embeddings**: true for <=4B and 30B-A3B, false for >=8B and 235B-A22B
+- **MoE** (30B-A3B, 235B-A22B): Router + 128 expert FFNs per layer, top-8 routing per token
 
 ## Module Layout
 
@@ -22,7 +23,7 @@ Qwen3 is a decoder-only transformer with these distinguishing features vs Llama:
 src/
   lib.rs           # Re-exports: model, sampling, tokenizer (cache & transformer are pub(crate))
   model.rs         # Qwen3Config (serde from config.json), Qwen3<B> (generation), SafeTensors loading
-  transformer.rs   # Transformer, TransformerBlock, MultiHeadAttention, FeedForward, RmsNorm, RotaryEmbedding
+  transformer.rs   # Transformer, TransformerBlock, Mlp (Dense/Moe), MoeLayer, MultiHeadAttention, FeedForward, RmsNorm, RotaryEmbedding
   cache.rs         # KvCache - pre-allocated [batch, heads, max_seq, head_dim] with sliding window
   sampling.rs      # Sampler enum: TopP (nucleus) and Argmax
   tokenizer.rs     # Qwen3Tokenizer wrapping HF `tokenizers` crate
@@ -34,7 +35,7 @@ examples/
 
 PyTorch stores Linear weights as `[out_features, in_features]`; Burn stores as `[in_features, out_features]`. All Linear weights are **transposed** during loading (`get_linear_weight`). Embedding weights are loaded without transpose (`get_tensor_2d_raw`). When `tie_word_embeddings=true`, the embedding weight is transposed and used as the lm_head weight.
 
-SafeTensors key mapping:
+SafeTensors key mapping (dense layers):
 - `model.embed_tokens.weight` -> Embedding
 - `model.layers.{i}.self_attn.{q,k,v,o}_proj.weight` -> Linear (transposed)
 - `model.layers.{i}.self_attn.{q,k}_norm.weight` -> RmsNorm (1D)
@@ -42,6 +43,11 @@ SafeTensors key mapping:
 - `model.layers.{i}.{input,post_attention}_layernorm.weight` -> RmsNorm (1D)
 - `model.norm.weight` -> final RmsNorm
 - `lm_head.weight` -> Linear (transposed, or tied with embedding)
+
+SafeTensors key mapping (MoE layers):
+- `model.layers.{i}.mlp.experts.gate_up_proj` -> 3D `[num_experts, 2*moe_intermediate, hidden]` (per-expert transposed via swap_dims)
+- `model.layers.{i}.mlp.experts.down_proj` -> 3D `[num_experts, hidden, moe_intermediate]` (per-expert transposed via swap_dims)
+- `model.layers.{i}.mlp.router.weight` -> 2D `[num_experts, hidden]` (no transpose)
 
 ## Build & Test
 
@@ -71,7 +77,17 @@ Backend features are mutually exclusive: `wgpu` (Metal on macOS), `ndarray` (CPU
 - KV cache uses pre-allocated tensors with `slice_assign` for appending; sliding window shifts when exceeding max_seq_len
 - Generation loop: full prompt in one forward pass, then one token at a time with cache
 
+### MoE Implementation
+
+- `Mlp` enum (`Dense`/`Moe`) makes TransformerBlock polymorphic — each layer is independently dense or MoE
+- `MoeLayer` stores packed 3D expert weights (gate_up_proj, down_proj) and a 2D router weight
+- Forward: router softmax → top-k selection → optional renormalization (`norm_topk_prob`) → per-expert gather/SwiGLU/scatter
+- Expert routing iterates over experts on CPU (index selection), dispatches GPU matmuls per active expert
+- `Qwen3Config::is_moe_layer(i)` determines per-layer type via `decoder_sparse_step` and `mlp_only_layers`
+
 ## Model Sizes
+
+### Dense Models
 
 | Model | Layers | Hidden | Heads | KV Heads | Intermediate |
 |-------|--------|--------|-------|----------|--------------|
@@ -79,6 +95,13 @@ Backend features are mutually exclusive: `wgpu` (Metal on macOS), `ndarray` (CPU
 | 1.7B  | 28     | 1536   | 16    | 8        | 4608         |
 | 4B    | 36     | 2560   | 32    | 8        | 9728         |
 | 8B    | 36     | 4096   | 32    | 8        | 12288        |
+
+### MoE Models
+
+| Model | Layers | Hidden | Heads | KV Heads | Experts | Top-K | MoE Intermediate |
+|-------|--------|--------|-------|----------|---------|-------|------------------|
+| 30B-A3B | 48   | 2048   | 32    | 4        | 128     | 8     | 768              |
+| 235B-A22B | 94 | 4096   | 64    | 4        | 128     | 8     | 1536             |
 
 ## Performance
 
