@@ -34,6 +34,30 @@ impl<B: Backend> KvCache<B> {
     /// Append new key/value tensor to the cache and return the accumulated result.
     pub fn forward(&mut self, tensor: Tensor<B, 4>) -> Tensor<B, 4> {
         let [batch_size, num_heads, seq_len, head_dim] = tensor.dims();
+
+        // If the incoming chunk fills or exceeds the cache, just keep the last max_seq_len tokens
+        if seq_len >= self.max_seq_len {
+            let start = seq_len - self.max_seq_len;
+            let truncated =
+                tensor.slice([0..batch_size, 0..num_heads, start..seq_len, 0..head_dim]);
+            self.cache = self.cache.clone().slice_assign(
+                [
+                    0..batch_size,
+                    0..num_heads,
+                    0..self.max_seq_len,
+                    0..head_dim,
+                ],
+                truncated,
+            );
+            self.cur_seq_len = self.max_seq_len;
+            return self.cache.clone().slice([
+                0..batch_size,
+                0..num_heads,
+                0..self.max_seq_len,
+                0..head_dim,
+            ]);
+        }
+
         let mut new_seq_len = self.cur_seq_len + seq_len;
 
         // If we exceed max_seq_len, shift the cache (sliding window)
@@ -183,5 +207,40 @@ mod tests {
         assert_eq!(vals[2], 3.0);
         assert_eq!(vals[4], 4.0);
         assert_eq!(vals[6], 5.0);
+    }
+
+    #[test]
+    fn cache_chunk_larger_than_max_seq_len() {
+        let dev = device();
+        let mut cache = KvCache::<B>::new(1, 1, 3, 2, &dev); // max_seq_len=3
+
+        // Append 5 tokens into a cache of size 3 — should keep last 3
+        let t = Tensor::<B, 4>::from_floats(
+            [[[[1.0, 0.0], [2.0, 0.0], [3.0, 0.0], [4.0, 0.0], [5.0, 0.0]]]],
+            &dev,
+        );
+        let out = cache.forward(t);
+        assert_eq!(cache.len(), 3);
+        assert_eq!(out.dims(), [1, 1, 3, 2]);
+        let vals: Vec<f32> = out.to_data().iter::<f32>().collect();
+        assert_eq!(vals[0], 3.0);
+        assert_eq!(vals[2], 4.0);
+        assert_eq!(vals[4], 5.0);
+    }
+
+    #[test]
+    fn cache_chunk_exactly_max_seq_len() {
+        let dev = device();
+        let mut cache = KvCache::<B>::new(1, 1, 3, 2, &dev); // max_seq_len=3
+
+        // Append exactly 3 tokens into cache of size 3
+        let t = Tensor::<B, 4>::from_floats([[[[1.0, 0.0], [2.0, 0.0], [3.0, 0.0]]]], &dev);
+        let out = cache.forward(t);
+        assert_eq!(cache.len(), 3);
+        assert_eq!(out.dims(), [1, 1, 3, 2]);
+        let vals: Vec<f32> = out.to_data().iter::<f32>().collect();
+        assert_eq!(vals[0], 1.0);
+        assert_eq!(vals[2], 2.0);
+        assert_eq!(vals[4], 3.0);
     }
 }

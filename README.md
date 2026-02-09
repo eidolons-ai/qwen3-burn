@@ -68,7 +68,7 @@ let mut model = Qwen3::<Wgpu>::from_pretrained("./models/Qwen3-0.6B", 2048, &dev
 let mut sampler = Sampler::new_top_p(0.9, 42);
 
 let prompt = tokenizer.apply_chat_template("You are a helpful assistant.", "What is 2+2?");
-let output = model.generate(&tokenizer, &prompt, 256, 0.6, &mut sampler);
+let output = model.generate(&tokenizer, &prompt, 256, 0.6, &mut sampler).unwrap();
 println!("{}", output.text);
 ```
 
@@ -95,7 +95,7 @@ let output = model.generate_streaming(
         }
         ControlFlow::Continue(()) // return Break(()) to cancel early
     },
-);
+).unwrap();
 ```
 
 ## Supported Models
@@ -116,7 +116,7 @@ MoE models use 128 experts with top-8 routing per token. The model directory mus
 ## Testing
 
 ```bash
-cargo test            # 50 unit tests, no GPU or model weights needed
+cargo test            # unit tests, no GPU or model weights needed
 cargo fmt -- --check  # formatting
 cargo clippy --all-targets  # lints (example warnings are expected without a backend feature)
 ```
@@ -126,7 +126,7 @@ cargo clippy --all-targets  # lints (example warnings are expected without a bac
 Criterion benchmarks cover all core operations using Qwen3-0.6B dimensions on CPU (NdArray backend). No GPU or model weights needed.
 
 ```bash
-cargo bench --features bench              # All 48 benchmarks
+cargo bench --features bench              # All benchmarks
 cargo bench --features bench -- rms_norm  # Single group
 cargo bench --features bench -- "attention/decode"  # Subset
 ```

@@ -125,7 +125,13 @@ fn run<B: burn::prelude::Backend>(args: Args, device: burn::prelude::Device<B>) 
             ControlFlow::Continue(())
         },
     );
-    let _ = result;
+    match result {
+        Ok(_) => {}
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    }
 }
 
 fn main() {

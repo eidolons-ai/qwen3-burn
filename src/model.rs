@@ -277,11 +277,14 @@ pub struct GenerationParams<'a> {
 }
 
 /// Qwen3 language model for text generation.
+///
+/// Only batch size 1 is supported. KV caches and sampling are not designed for batched inference.
 pub struct Qwen3<B: Backend> {
     transformer: Transformer<B>,
     rope: RotaryEmbedding<B>,
     caches: Vec<AttentionKvCache<B>>,
     config: Qwen3Config,
+    max_seq_len: usize,
     device: Device<B>,
 }
 
@@ -348,6 +351,7 @@ impl<B: Backend> Qwen3<B> {
             rope,
             caches,
             config,
+            max_seq_len,
             device: device.clone(),
         })
     }
@@ -367,7 +371,7 @@ impl<B: Backend> Qwen3<B> {
         max_new_tokens: usize,
         temperature: f64,
         sampler: &mut Sampler,
-    ) -> GenerationOutput {
+    ) -> Result<GenerationOutput, String> {
         self.generate_streaming(
             tokenizer,
             GenerationParams {
@@ -385,16 +389,25 @@ impl<B: Backend> Qwen3<B> {
     ///
     /// The `callback` receives [`GenerationEvent`]s as generation progresses.
     /// Return `ControlFlow::Break(())` from the callback to cancel generation early.
+    ///
+    /// Returns an error if the prompt exceeds the model's `max_seq_len`.
     pub fn generate_streaming(
         &mut self,
         tokenizer: &Qwen3Tokenizer,
         params: GenerationParams,
         mut callback: impl FnMut(GenerationEvent) -> ControlFlow<()>,
-    ) -> GenerationOutput {
+    ) -> Result<GenerationOutput, String> {
         self.reset_caches();
 
         let tokens = tokenizer.encode(params.prompt);
         let prompt_len = tokens.len();
+
+        if prompt_len > self.max_seq_len {
+            return Err(format!(
+                "prompt length ({}) exceeds max_seq_len ({})",
+                prompt_len, self.max_seq_len
+            ));
+        }
         let mut all_tokens = tokens.clone();
         let eos_token = tokenizer.eos_token_id();
 
@@ -455,15 +468,32 @@ impl<B: Backend> Qwen3<B> {
                 prefill_time_secs: prefill_time,
                 stop_reason: StopReason::Cancelled,
             });
-            return GenerationOutput {
+            return Ok(GenerationOutput {
                 text: String::new(),
                 tokens: 0,
                 time: elapsed,
-            };
+            });
+        }
+
+        // Early return if no tokens requested
+        if params.max_new_tokens == 0 {
+            let elapsed = start_time.elapsed().as_secs_f64();
+            let _ = callback(GenerationEvent::Done {
+                tokens_generated: 0,
+                total_time_secs: elapsed,
+                prefill_time_secs: prefill_time,
+                stop_reason: StopReason::MaxTokens,
+            });
+            return Ok(GenerationOutput {
+                text: String::new(),
+                tokens: 0,
+                time: elapsed,
+            });
         }
 
         // Sample first token from prefill logits
-        let logits_2d = last_logits_2d.expect("prompt must not be empty");
+        let logits_2d = last_logits_2d
+            .ok_or_else(|| "prompt must not be empty (encoded to zero tokens)".to_string())?;
         let mut next_token = sample_token(&logits_2d, params.temperature, params.sampler);
         all_tokens.push(next_token);
         generated_count += 1;
@@ -487,29 +517,25 @@ impl<B: Backend> Qwen3<B> {
                     prefill_time_secs: prefill_time,
                     stop_reason: StopReason::Cancelled,
                 });
-                return GenerationOutput {
+                return Ok(GenerationOutput {
                     text: tokenizer.decode(&all_tokens[prompt_len..]),
                     tokens: generated_count,
                     time: elapsed,
-                };
+                });
             }
 
             // Autoregressive generation
+            // No causal mask needed for single-token decode: the sole query
+            // attends to all cached positions, so the mask would be all-zeros.
             let mut stop = StopReason::MaxTokens;
             for _ in 1..params.max_new_tokens {
                 let td = TensorData::new(vec![next_token as i32], [1]);
                 let token_tensor =
                     Tensor::<B, 1, Int>::from_data(td, &self.device).unsqueeze::<2>();
 
-                let total_len = pos + 1;
-                let mask = build_causal_mask::<B>(1, total_len, &self.device);
-                let logits = self.transformer.forward(
-                    token_tensor,
-                    &self.rope,
-                    Some(mask),
-                    &mut self.caches,
-                    pos,
-                );
+                let logits =
+                    self.transformer
+                        .forward(token_tensor, &self.rope, None, &mut self.caches, pos);
 
                 let logits = logits.reshape([1, self.config.vocab_size]);
                 next_token = sample_token(&logits, params.temperature, params.sampler);
@@ -544,24 +570,31 @@ impl<B: Backend> Qwen3<B> {
             prefill_time_secs: prefill_time,
             stop_reason,
         });
-        GenerationOutput {
+        Ok(GenerationOutput {
             text: tokenizer.decode(&all_tokens[prompt_len..]),
             tokens: generated_count,
             time: elapsed,
-        }
+        })
     }
 }
 
 /// Apply temperature scaling and sample a token.
 fn sample_token<B: Backend>(logits: &Tensor<B, 2>, temperature: f64, sampler: &mut Sampler) -> u32 {
-    let logits = if temperature > 0.0 {
-        let scaled = logits.clone() / temperature;
-        activation::softmax(scaled, 1)
-    } else {
-        logits.clone()
-    };
+    if temperature <= 0.0 {
+        // Greedy: always pick the highest-logit token regardless of sampler
+        return logits
+            .clone()
+            .argmax(1)
+            .to_data()
+            .iter::<i64>()
+            .next()
+            .unwrap() as u32;
+    }
 
-    let token_id = sampler.sample(logits);
+    let scaled = logits.clone() / temperature;
+    let probs = activation::softmax(scaled, 1);
+
+    let token_id = sampler.sample(probs);
     let token_data = token_id.to_data();
     let val = token_data.iter::<i64>().next().unwrap();
     val as u32
