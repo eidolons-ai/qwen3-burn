@@ -7,11 +7,30 @@ use burn::prelude::*;
 use burn::tensor::TensorData;
 use serde::Deserialize;
 
+use crate::gguf;
 use crate::sampling::Sampler;
 use crate::tokenizer::Qwen3Tokenizer;
 use crate::transformer::{
     build_causal_mask, AttentionKvCache, MoeConfig, RotaryEmbedding, Transformer,
 };
+
+/// Weight quantization mode applied after loading.
+///
+/// Uses Burn's native `Quantizer` to store weights in packed quantized format
+/// (`PackedU32`) for real memory savings. Requires a GPU backend (WGPU, CUDA);
+/// the NdArray/CPU backend does not support `PackedU32` storage. A selective
+/// wrapper skips 1D tensors (RMSNorm weights) and embedding weights.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub enum QuantizationMode {
+    #[default]
+    None,
+    /// INT8 symmetric per-block quantization (Q8S, block size 32). Requires GPU backend.
+    Int8,
+    /// INT4 symmetric per-block quantization (Q4S, block size 32). Requires GPU backend.
+    /// NOTE: Currently broken on WGPU/Metal — Q4S matmul panics when M > 1 (i.e. during
+    /// prefill). See https://github.com/tracel-ai/burn/issues/4492
+    Int4,
+}
 
 /// Qwen3 model configuration matching HuggingFace `config.json`.
 #[derive(Debug, Clone, Deserialize)]
@@ -292,6 +311,7 @@ impl<B: Backend> Qwen3<B> {
     pub fn from_pretrained(
         model_dir: impl AsRef<Path>,
         max_seq_len: usize,
+        quantization: QuantizationMode,
         device: &Device<B>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let model_dir = model_dir.as_ref();
@@ -330,6 +350,96 @@ impl<B: Backend> Qwen3<B> {
 
         // Load weights from safetensors
         let transformer = load_safetensors_weights(transformer, model_dir, &config, device)?;
+
+        // Quantize weights if requested
+        let transformer = apply_quantization(transformer, quantization);
+
+        let rope = RotaryEmbedding::new(config.head_dim, max_seq_len, config.rope_theta, device);
+
+        let caches = (0..config.num_hidden_layers)
+            .map(|_| {
+                AttentionKvCache::new(
+                    1,
+                    config.num_key_value_heads,
+                    max_seq_len,
+                    config.head_dim,
+                    device,
+                )
+            })
+            .collect();
+
+        Ok(Self {
+            transformer,
+            rope,
+            caches,
+            config,
+            max_seq_len,
+            device: device.clone(),
+        })
+    }
+
+    /// Load a Qwen3 model from a GGUF file.
+    ///
+    /// Only requires a single `.gguf` file; config is extracted from GGUF metadata.
+    /// Supported GGUF quantization types: F32, F16, BF16, Q8_0, Q4_0.
+    pub fn from_gguf(
+        gguf_path: impl AsRef<Path>,
+        max_seq_len: usize,
+        quantization: QuantizationMode,
+        device: &Device<B>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let (gguf_file, mut file) = gguf::GgufFile::open(gguf_path)?;
+
+        // Extract config from GGUF metadata
+        let config = gguf::extract_config(&gguf_file)?;
+        eprintln!(
+            "GGUF config: hidden={}, layers={}, heads={}, kv_heads={}, vocab={}{}",
+            config.hidden_size,
+            config.num_hidden_layers,
+            config.num_attention_heads,
+            config.num_key_value_heads,
+            config.vocab_size,
+            if config.is_moe() {
+                format!(", MoE experts={}", config.num_experts.unwrap_or(0))
+            } else {
+                String::new()
+            }
+        );
+
+        // Build MoE config if needed
+        let moe_config = if config.is_moe() {
+            Some(MoeConfig {
+                num_experts: config.num_experts.unwrap(),
+                num_experts_per_tok: config.num_experts_per_tok.unwrap(),
+                moe_intermediate_size: config.moe_intermediate_size.unwrap(),
+                norm_topk_prob: config.norm_topk_prob.unwrap_or(true),
+                mlp_only_layers: config.mlp_only_layers.clone().unwrap_or_default(),
+                decoder_sparse_step: config.decoder_sparse_step.unwrap_or(1),
+            })
+        } else {
+            None
+        };
+
+        // Create model skeleton
+        let transformer = Transformer::new(
+            config.vocab_size,
+            config.hidden_size,
+            config.num_hidden_layers,
+            config.num_attention_heads,
+            config.num_key_value_heads,
+            config.head_dim,
+            config.intermediate_size,
+            config.rms_norm_eps,
+            config.tie_word_embeddings,
+            moe_config.as_ref(),
+            device,
+        );
+
+        // Load weights from GGUF
+        let transformer = load_gguf_weights(transformer, &gguf_file, &mut file, &config, device)?;
+
+        // Quantize if requested
+        let transformer = apply_quantization(transformer, quantization);
 
         let rope = RotaryEmbedding::new(config.head_dim, max_seq_len, config.rope_theta, device);
 
@@ -911,6 +1021,268 @@ fn load_safetensors_weights<B: Backend>(
     Ok(transformer)
 }
 
+/// Load GGUF weights into the transformer model.
+fn load_gguf_weights<B: Backend>(
+    mut transformer: Transformer<B>,
+    gguf_file: &gguf::GgufFile,
+    file: &mut std::fs::File,
+    config: &Qwen3Config,
+    device: &Device<B>,
+) -> Result<Transformer<B>, Box<dyn std::error::Error>> {
+    // Helper: read a tensor from GGUF and return as f32 vec with reversed dims (PyTorch convention)
+    let read_tensor = |file: &mut std::fs::File,
+                       name: &str|
+     -> Result<(Vec<f32>, Vec<usize>), Box<dyn std::error::Error>> {
+        let info = gguf_file
+            .tensors
+            .get(name)
+            .ok_or_else(|| format!("GGUF tensor '{}' not found", name))?;
+        let data = gguf_file.read_tensor_data(file, info)?;
+        // Reverse dims from GGUF (innermost-first) to PyTorch (outermost-first)
+        let shape: Vec<usize> = info.dims.iter().rev().copied().collect();
+        Ok((data, shape))
+    };
+
+    // Helper: create a 1D Burn tensor
+    let make_1d = |data: Vec<f32>, device: &Device<B>| -> Tensor<B, 1> {
+        let len = data.len();
+        Tensor::from_data(TensorData::new(data, [len]), device)
+    };
+
+    // Helper: create a 2D Burn tensor
+    let make_2d = |data: Vec<f32>, shape: &[usize], device: &Device<B>| -> Tensor<B, 2> {
+        Tensor::from_data(TensorData::new(data, [shape[0], shape[1]]), device)
+    };
+
+    // Helper: create a 3D Burn tensor
+    let make_3d = |data: Vec<f32>, shape: &[usize], device: &Device<B>| -> Tensor<B, 3> {
+        Tensor::from_data(
+            TensorData::new(data, [shape[0], shape[1], shape[2]]),
+            device,
+        )
+    };
+
+    // Load embedding
+    eprintln!("Loading embedding weights...");
+    let (embed_data, embed_shape) = read_tensor(file, "token_embd.weight")?;
+    let embed_weight = make_2d(embed_data, &embed_shape, device);
+    transformer = transformer.load_embed_tokens(embed_weight);
+
+    // Load layers
+    for i in 0..config.num_hidden_layers {
+        if i % 10 == 0 {
+            eprintln!("Loading layer {}/{}...", i, config.num_hidden_layers);
+        }
+
+        // Attention projections — GGUF stores [out, in] (PyTorch convention after dim reversal),
+        // Burn needs [in, out], so transpose.
+        let (q_data, q_shape) = read_tensor(file, &format!("blk.{}.attn_q.weight", i))?;
+        let q_proj_w = make_2d(q_data, &q_shape, device).transpose();
+
+        let (k_data, k_shape) = read_tensor(file, &format!("blk.{}.attn_k.weight", i))?;
+        let k_proj_w = make_2d(k_data, &k_shape, device).transpose();
+
+        let (v_data, v_shape) = read_tensor(file, &format!("blk.{}.attn_v.weight", i))?;
+        let v_proj_w = make_2d(v_data, &v_shape, device).transpose();
+
+        let (o_data, o_shape) = read_tensor(file, &format!("blk.{}.attn_output.weight", i))?;
+        let o_proj_w = make_2d(o_data, &o_shape, device).transpose();
+
+        // QK-Norm weights (1D)
+        let (qn_data, _) = read_tensor(file, &format!("blk.{}.attn_q_norm.weight", i))?;
+        let q_norm_w = make_1d(qn_data, device);
+
+        let (kn_data, _) = read_tensor(file, &format!("blk.{}.attn_k_norm.weight", i))?;
+        let k_norm_w = make_1d(kn_data, device);
+
+        // Layer norms (1D)
+        let (iln_data, _) = read_tensor(file, &format!("blk.{}.attn_norm.weight", i))?;
+        let input_ln_w = make_1d(iln_data, device);
+
+        let (pln_data, _) = read_tensor(file, &format!("blk.{}.ffn_norm.weight", i))?;
+        let post_attn_ln_w = make_1d(pln_data, device);
+
+        if config.is_moe_layer(i) {
+            // MoE layer: GGUF stores gate and up as separate packed 3D tensors.
+            // After dim reversal, shapes are [num_experts, moe_intermediate, hidden].
+            // We need to transpose each expert [moe_intermediate, hidden] -> [hidden, moe_intermediate],
+            // then concatenate gate and up along dim 2 to get [num_experts, hidden, 2*moe_intermediate].
+            let (gate_data, gate_shape) =
+                read_tensor(file, &format!("blk.{}.ffn_gate_exps.weight", i))?;
+            let gate_3d = make_3d(gate_data, &gate_shape, device).swap_dims(1, 2);
+
+            let (up_data, up_shape) = read_tensor(file, &format!("blk.{}.ffn_up_exps.weight", i))?;
+            let up_3d = make_3d(up_data, &up_shape, device).swap_dims(1, 2);
+
+            // Concatenate gate and up along dim 2: [num_experts, hidden, 2*moe_intermediate]
+            let gate_up_proj = burn::tensor::Tensor::cat(vec![gate_3d, up_3d], 2);
+
+            // down_proj: [num_experts, hidden, moe_intermediate] -> swap to [num_experts, moe_intermediate, hidden]
+            let (down_data, down_shape) =
+                read_tensor(file, &format!("blk.{}.ffn_down_exps.weight", i))?;
+            let down_proj = make_3d(down_data, &down_shape, device).swap_dims(1, 2);
+
+            // Router weight: [num_experts, hidden] (no transpose needed)
+            let (router_data, router_shape) =
+                read_tensor(file, &format!("blk.{}.ffn_gate_inp.weight", i))?;
+            let router_weight = make_2d(router_data, &router_shape, device);
+
+            transformer = transformer.load_moe_layer(
+                i,
+                q_proj_w,
+                k_proj_w,
+                v_proj_w,
+                o_proj_w,
+                q_norm_w,
+                k_norm_w,
+                gate_up_proj,
+                down_proj,
+                router_weight,
+                input_ln_w,
+                post_attn_ln_w,
+            );
+        } else {
+            // Dense layer: individual MLP weights, transpose each [out, in] -> [in, out]
+            let (gate_data, gate_shape) = read_tensor(file, &format!("blk.{}.ffn_gate.weight", i))?;
+            let gate_proj_w = make_2d(gate_data, &gate_shape, device).transpose();
+
+            let (up_data, up_shape) = read_tensor(file, &format!("blk.{}.ffn_up.weight", i))?;
+            let up_proj_w = make_2d(up_data, &up_shape, device).transpose();
+
+            let (down_data, down_shape) = read_tensor(file, &format!("blk.{}.ffn_down.weight", i))?;
+            let down_proj_w = make_2d(down_data, &down_shape, device).transpose();
+
+            transformer = transformer.load_layer(
+                i,
+                q_proj_w,
+                k_proj_w,
+                v_proj_w,
+                o_proj_w,
+                q_norm_w,
+                k_norm_w,
+                gate_proj_w,
+                up_proj_w,
+                down_proj_w,
+                input_ln_w,
+                post_attn_ln_w,
+            );
+        }
+    }
+
+    // Load final norm
+    eprintln!("Loading final norm and lm_head...");
+    let (norm_data, _) = read_tensor(file, "output_norm.weight")?;
+    let norm_weight = make_1d(norm_data, device);
+    transformer = transformer.load_norm(norm_weight);
+
+    // Load lm_head
+    if config.tie_word_embeddings {
+        // Re-read embedding and transpose for lm_head: [vocab, hidden] -> [hidden, vocab]
+        let (embed_data, embed_shape) = read_tensor(file, "token_embd.weight")?;
+        let embed_weight = make_2d(embed_data, &embed_shape, device);
+        transformer = transformer.load_lm_head(embed_weight.transpose());
+    } else {
+        let (lm_data, lm_shape) = read_tensor(file, "output.weight")?;
+        let lm_head_weight = make_2d(lm_data, &lm_shape, device).transpose();
+        transformer = transformer.load_lm_head(lm_head_weight);
+    }
+
+    eprintln!("Model loaded successfully.");
+    Ok(transformer)
+}
+
+/// A selective quantizer wrapping Burn's native `Quantizer`.
+///
+/// Skips parameters that are sensitive to quantization:
+/// - 1D tensors (RMSNorm weights)
+/// - Embedding weights (`embed_tokens`)
+///
+/// Also forces tensors to be contiguous before quantization. Model weights are
+/// loaded as `[out, in]` then `.transpose()`d to `[in, out]`, which creates
+/// non-contiguous memory views. Burn's block quantization computes scales over
+/// physical memory blocks, but dequantization applies them over logical blocks,
+/// causing catastrophic errors (~500x) for non-contiguous tensors.
+struct SelectiveQuantizer {
+    quantizer: burn::module::Quantizer,
+    /// Module path segments tracked via enter/exit.
+    path: Vec<String>,
+}
+
+impl<B: Backend> burn::module::ModuleMapper<B> for SelectiveQuantizer {
+    fn enter_module(&mut self, name: &str, _container_type: &str) {
+        self.path.push(name.to_string());
+    }
+
+    fn exit_module(&mut self, _name: &str, _container_type: &str) {
+        self.path.pop();
+    }
+
+    fn map_float<const D: usize>(
+        &mut self,
+        param: burn::module::Param<Tensor<B, D>>,
+    ) -> burn::module::Param<Tensor<B, D>> {
+        // Skip 1D tensors (norm weights — tiny and critical for stability)
+        if D < 2 {
+            return param;
+        }
+
+        // Skip embedding weights (quantizing the lookup table degrades token representations)
+        if self.path.contains(&"embed_tokens".to_string()) {
+            return param;
+        }
+
+        // TODO: Remove once https://github.com/tracel-ai/burn/issues/4491 is fixed.
+        // Force contiguous layout before quantization. Transposed weights have
+        // non-contiguous memory which causes Burn's quantization to produce
+        // catastrophically wrong scales. Round-tripping through TensorData
+        // forces a contiguous copy.
+        let tensor = param.val();
+        let data = tensor.to_data();
+        let contiguous = Tensor::from_data(data, &tensor.device());
+        let param = burn::module::Param::from_tensor(contiguous);
+
+        self.quantizer.map_float(param)
+    }
+}
+
+/// Apply quantization to the transformer model using Burn's native quantization.
+///
+/// Weights are stored in quantized format with `PackedU32` storage for real
+/// memory savings on GPU backends (WGPU, CUDA). NdArray does not support
+/// `PackedU32`; quantization requires a GPU backend.
+fn apply_quantization<B: Backend>(
+    transformer: Transformer<B>,
+    mode: QuantizationMode,
+) -> Transformer<B> {
+    use burn::module::Module;
+    use burn::tensor::quantization::{Calibration, QuantLevel, QuantScheme, QuantValue};
+
+    let scheme = match mode {
+        QuantizationMode::None => return transformer,
+        QuantizationMode::Int8 => {
+            eprintln!("Quantizing weights to INT8...");
+            QuantScheme::default()
+                .with_value(QuantValue::Q8S)
+                .with_level(QuantLevel::block([32]))
+        }
+        QuantizationMode::Int4 => {
+            eprintln!("Quantizing weights to INT4...");
+            QuantScheme::default()
+                .with_value(QuantValue::Q4S)
+                .with_level(QuantLevel::block([32]))
+        }
+    };
+
+    let mut quantizer = SelectiveQuantizer {
+        quantizer: burn::module::Quantizer {
+            calibration: Calibration::MinMax,
+            scheme,
+        },
+        path: Vec::new(),
+    };
+    transformer.map(&mut quantizer)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1101,5 +1473,90 @@ mod tests {
             prefill_chunk_size: None,
         };
         assert!(params.prefill_chunk_size.is_none());
+    }
+
+    #[test]
+    fn quantization_mode_default_is_none() {
+        assert_eq!(QuantizationMode::default(), QuantizationMode::None);
+    }
+
+    #[test]
+    fn quantization_none_is_identity() {
+        use crate::transformer::{
+            build_causal_mask, AttentionKvCache, RotaryEmbedding, Transformer,
+        };
+        use burn::backend::NdArray;
+
+        type B = NdArray;
+        let dev: <B as burn::prelude::Backend>::Device = Default::default();
+
+        let transformer = Transformer::<B>::new(100, 32, 2, 4, 2, 8, 64, 1e-6, false, None, &dev);
+        let transformer = apply_quantization(transformer, QuantizationMode::None);
+
+        let rope = RotaryEmbedding::new(8, 16, 10000.0, &dev);
+        let mut caches: Vec<AttentionKvCache<B>> = (0..2)
+            .map(|_| AttentionKvCache::new(1, 2, 16, 8, &dev))
+            .collect();
+        let tokens = burn::tensor::Tensor::<B, 2, burn::tensor::Int>::from_data(
+            TensorData::new(vec![1i32, 2, 3], [1, 3]),
+            &dev,
+        );
+        let mask = build_causal_mask::<B>(3, 3, &dev);
+        let out = transformer.forward(tokens, &rope, Some(mask), &mut caches, 0);
+        assert_eq!(out.dims(), [1, 3, 100]);
+    }
+
+    #[test]
+    #[ignore] // PackedU32 storage requires a GPU backend (WGPU/CUDA)
+    fn quantization_int8_preserves_shape() {
+        use crate::transformer::{
+            build_causal_mask, AttentionKvCache, RotaryEmbedding, Transformer,
+        };
+        use burn::backend::NdArray;
+
+        type B = NdArray;
+        let dev: <B as burn::prelude::Backend>::Device = Default::default();
+
+        let transformer = Transformer::<B>::new(100, 32, 2, 4, 2, 8, 64, 1e-6, false, None, &dev);
+        let transformer = apply_quantization(transformer, QuantizationMode::Int8);
+
+        let rope = RotaryEmbedding::new(8, 16, 10000.0, &dev);
+        let mut caches: Vec<AttentionKvCache<B>> = (0..2)
+            .map(|_| AttentionKvCache::new(1, 2, 16, 8, &dev))
+            .collect();
+        let tokens = burn::tensor::Tensor::<B, 2, burn::tensor::Int>::from_data(
+            TensorData::new(vec![1i32, 2, 3], [1, 3]),
+            &dev,
+        );
+        let mask = build_causal_mask::<B>(3, 3, &dev);
+        let out = transformer.forward(tokens, &rope, Some(mask), &mut caches, 0);
+        assert_eq!(out.dims(), [1, 3, 100]);
+    }
+
+    #[test]
+    #[ignore] // INT4 uses PackedU32 storage which requires a GPU backend (WGPU/CUDA)
+    fn quantization_int4_preserves_shape() {
+        use crate::transformer::{
+            build_causal_mask, AttentionKvCache, RotaryEmbedding, Transformer,
+        };
+        use burn::backend::NdArray;
+
+        type B = NdArray;
+        let dev: <B as burn::prelude::Backend>::Device = Default::default();
+
+        let transformer = Transformer::<B>::new(100, 32, 2, 4, 2, 8, 64, 1e-6, false, None, &dev);
+        let transformer = apply_quantization(transformer, QuantizationMode::Int4);
+
+        let rope = RotaryEmbedding::new(8, 16, 10000.0, &dev);
+        let mut caches: Vec<AttentionKvCache<B>> = (0..2)
+            .map(|_| AttentionKvCache::new(1, 2, 16, 8, &dev))
+            .collect();
+        let tokens = burn::tensor::Tensor::<B, 2, burn::tensor::Int>::from_data(
+            TensorData::new(vec![1i32, 2, 3], [1, 3]),
+            &dev,
+        );
+        let mask = build_causal_mask::<B>(3, 3, &dev);
+        let out = transformer.forward(tokens, &rope, Some(mask), &mut caches, 0);
+        assert_eq!(out.dims(), [1, 3, 100]);
     }
 }

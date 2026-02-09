@@ -2,7 +2,7 @@
 
 Qwen3 inference in Rust, built on the [Burn](https://burn.dev) deep learning framework.
 
-Loads weights directly from HuggingFace SafeTensors files. Runs on Metal (macOS), CUDA (NVIDIA), or CPU.
+Loads weights from HuggingFace SafeTensors or GGUF (pre-quantized) files. Supports INT8/INT4 weight quantization. Runs on Metal (macOS), CUDA (NVIDIA), or CPU.
 
 ## Quick Start
 
@@ -13,20 +13,32 @@ Loads weights directly from HuggingFace SafeTensors files. Runs on Metal (macOS)
 ```bash
 pip install huggingface-hub
 
-# Qwen3-0.6B (~1.5 GB)
+# Option A: SafeTensors (full precision, ~1.5 GB)
 python3 -c "
 from huggingface_hub import snapshot_download
 snapshot_download('Qwen/Qwen3-0.6B', local_dir='./models/Qwen3-0.6B',
     allow_patterns=['*.safetensors', 'config.json', 'tokenizer.json'])
+"
+
+# Option B: GGUF (pre-quantized Q8_0, ~639 MB — also needs tokenizer.json from base model)
+python3 -c "
+from huggingface_hub import hf_hub_download
+hf_hub_download('Qwen/Qwen3-0.6B-GGUF', 'Qwen3-0.6B-Q8_0.gguf', local_dir='./models/Qwen3-0.6B-GGUF')
+hf_hub_download('Qwen/Qwen3-0.6B', 'tokenizer.json', local_dir='./models/Qwen3-0.6B-GGUF')
 "
 ```
 
 **3. Run:**
 
 ```bash
-# macOS (Metal)
+# SafeTensors — macOS (Metal)
 cargo run --release --features wgpu --example chat -- \
   --model-path ./models/Qwen3-0.6B \
+  --prompt "Explain quicksort in one sentence"
+
+# GGUF — auto-detected from .gguf extension
+cargo run --release --features wgpu --example chat -- \
+  --model-path ./models/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf \
   --prompt "Explain quicksort in one sentence"
 
 # CPU (slower, no GPU required)
@@ -43,13 +55,15 @@ cargo run --release --features cuda --example chat -- \
 ## Chat Example Options
 
 ```
---model-path PATH    Model directory (required)
+--model-path PATH    Model directory or .gguf file (required)
 --prompt TEXT        Input prompt (default: "What is the capital of France?")
 --temperature FLOAT  Sampling temperature, 0.0 = greedy (default: 0.6)
 --top-p FLOAT        Nucleus sampling threshold (default: 0.9)
 -n, --max-tokens N   Max tokens to generate (default: 256)
 --max-seq-len N      Context window size (default: 2048)
 --chunk-size N       Prefill chunk size in tokens (default: full prompt at once)
+--quantize MODE      Weight quantization: none, int8, int4 (default: none)
+--format FORMAT      Model format: auto, safetensors, gguf (default: auto)
 --seed N             RNG seed (default: 42)
 ```
 
@@ -60,6 +74,7 @@ use burn::backend::Wgpu;
 use burn::backend::wgpu::WgpuDevice;
 use burn::tensor::f16;
 use qwen3_burn::model::Qwen3;
+use qwen3_burn::QuantizationMode;
 use qwen3_burn::sampling::Sampler;
 use qwen3_burn::tokenizer::Qwen3Tokenizer;
 
@@ -67,7 +82,9 @@ type Backend = Wgpu<f16, i32>;  // f16 for 2x memory savings + faster Metal/Vulk
 
 let device = WgpuDevice::default();
 let tokenizer = Qwen3Tokenizer::new("./models/Qwen3-0.6B/tokenizer.json").unwrap();
-let mut model = Qwen3::<Backend>::from_pretrained("./models/Qwen3-0.6B", 2048, &device).unwrap();
+let mut model = Qwen3::<Backend>::from_pretrained(
+    "./models/Qwen3-0.6B", 2048, QuantizationMode::None, &device,
+).unwrap();
 let mut sampler = Sampler::new_top_p(0.9, 42);
 
 let prompt = tokenizer.apply_chat_template("You are a helpful assistant.", "What is 2+2?");
@@ -101,6 +118,37 @@ let output = model.generate_streaming(
 ).unwrap();
 ```
 
+## Quantization
+
+Reduce memory usage by quantizing weights after loading:
+
+```rust
+use qwen3_burn::QuantizationMode;
+
+// INT8: ~4x memory reduction, minimal quality loss
+let mut model = Qwen3::<Wgpu>::from_pretrained(
+    "./models/Qwen3-8B", 2048, QuantizationMode::Int8, &device,
+).unwrap();
+
+// INT4: ~8x memory reduction (requires WGPU or CUDA backend)
+let mut model = Qwen3::<Wgpu>::from_pretrained(
+    "./models/Qwen3-8B", 2048, QuantizationMode::Int4, &device,
+).unwrap();
+```
+
+From the CLI:
+
+```bash
+cargo run --release --features wgpu --example chat -- \
+  --model-path ./models/Qwen3-8B --prompt "Hello" --quantize int8
+```
+
+| Mode | Memory | Quality | Backend Support |
+|------|--------|---------|-----------------|
+| `none` | Full (FP32) | Best | All |
+| `int8` | ~1/4 | Very good | All |
+| `int4` | ~1/8 | Good | All |
+
 ## Supported Models
 
 Both dense and Mixture of Experts (MoE) Qwen3 models are supported. Preset configs are provided for:
@@ -114,7 +162,11 @@ Both dense and Mixture of Experts (MoE) Qwen3 models are supported. Preset confi
 | Qwen3-30B-A3B | 30B | 3B | MoE | `Qwen/Qwen3-30B-A3B` |
 | Qwen3-235B-A22B | 235B | 22B | MoE | `Qwen/Qwen3-235B-A22B` |
 
-MoE models use 128 experts with top-8 routing per token. The model directory must contain `config.json`, `tokenizer.json`, and `*.safetensors`.
+MoE models use 128 experts with top-8 routing per token.
+
+**SafeTensors**: model directory must contain `config.json`, `tokenizer.json`, and `*.safetensors`.
+
+**GGUF**: a single `.gguf` file plus `tokenizer.json` in the same directory. Config is extracted from GGUF metadata. Supported quantization types: F32, F16, BF16, Q8_0, Q4_0.
 
 ## Testing
 
