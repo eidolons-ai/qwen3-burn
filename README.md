@@ -49,6 +49,7 @@ cargo run --release --features cuda --example chat -- \
 --top-p FLOAT        Nucleus sampling threshold (default: 0.9)
 -n, --max-tokens N   Max tokens to generate (default: 256)
 --max-seq-len N      Context window size (default: 2048)
+--chunk-size N       Prefill chunk size in tokens (default: full prompt at once)
 --seed N             RNG seed (default: 42)
 ```
 
@@ -71,6 +72,32 @@ let output = model.generate(&tokenizer, &prompt, 256, 0.6, &mut sampler);
 println!("{}", output.text);
 ```
 
+### Streaming Generation
+
+Use `generate_streaming` for token-by-token output and optional chunked prefill:
+
+```rust
+use std::ops::ControlFlow;
+use qwen3_burn::model::{GenerationEvent, GenerationParams};
+
+let output = model.generate_streaming(
+    &tokenizer,
+    GenerationParams {
+        prompt: &prompt,
+        max_new_tokens: 256,
+        temperature: 0.6,
+        sampler: &mut sampler,
+        prefill_chunk_size: Some(512), // or None for full-prompt prefill
+    },
+    |event| {
+        if let GenerationEvent::Token { ref text, .. } = event {
+            print!("{}", text);
+        }
+        ControlFlow::Continue(()) // return Break(()) to cancel early
+    },
+);
+```
+
 ## Supported Models
 
 Both dense and Mixture of Experts (MoE) Qwen3 models are supported. Preset configs are provided for:
@@ -89,7 +116,7 @@ MoE models use 128 experts with top-8 routing per token. The model directory mus
 ## Testing
 
 ```bash
-cargo test            # 47 unit tests, no GPU or model weights needed
+cargo test            # 50 unit tests, no GPU or model weights needed
 cargo fmt -- --check  # formatting
 cargo clippy --all-targets  # lints (example warnings are expected without a backend feature)
 ```

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::ops::ControlFlow;
 use std::path::Path;
 use std::time::Instant;
 
@@ -236,6 +237,45 @@ pub struct GenerationOutput {
     pub time: f64,
 }
 
+/// Reason generation stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopReason {
+    Eos,
+    MaxTokens,
+    Cancelled,
+}
+
+/// Events emitted during streaming generation.
+#[derive(Debug, Clone)]
+pub enum GenerationEvent {
+    PrefillProgress {
+        chunks_completed: usize,
+        chunks_total: usize,
+        prompt_tokens: usize,
+    },
+    Token {
+        token_id: u32,
+        text: String,
+        tokens_generated: usize,
+    },
+    Done {
+        tokens_generated: usize,
+        total_time_secs: f64,
+        prefill_time_secs: f64,
+        stop_reason: StopReason,
+    },
+}
+
+/// Parameters for streaming generation.
+pub struct GenerationParams<'a> {
+    pub prompt: &'a str,
+    pub max_new_tokens: usize,
+    pub temperature: f64,
+    pub sampler: &'a mut Sampler,
+    /// Chunk size for prefill. `None` = process entire prompt at once.
+    pub prefill_chunk_size: Option<usize>,
+}
+
 /// Qwen3 language model for text generation.
 pub struct Qwen3<B: Backend> {
     transformer: Transformer<B>,
@@ -328,51 +368,55 @@ impl<B: Backend> Qwen3<B> {
         temperature: f64,
         sampler: &mut Sampler,
     ) -> GenerationOutput {
+        self.generate_streaming(
+            tokenizer,
+            GenerationParams {
+                prompt,
+                max_new_tokens,
+                temperature,
+                sampler,
+                prefill_chunk_size: None,
+            },
+            |_| ControlFlow::Continue(()),
+        )
+    }
+
+    /// Generate text with streaming callbacks and optional chunked prefill.
+    ///
+    /// The `callback` receives [`GenerationEvent`]s as generation progresses.
+    /// Return `ControlFlow::Break(())` from the callback to cancel generation early.
+    pub fn generate_streaming(
+        &mut self,
+        tokenizer: &Qwen3Tokenizer,
+        params: GenerationParams,
+        mut callback: impl FnMut(GenerationEvent) -> ControlFlow<()>,
+    ) -> GenerationOutput {
         self.reset_caches();
 
-        let tokens = tokenizer.encode(prompt);
+        let tokens = tokenizer.encode(params.prompt);
+        let prompt_len = tokens.len();
         let mut all_tokens = tokens.clone();
         let eos_token = tokenizer.eos_token_id();
 
         let start_time = Instant::now();
         let mut generated_count = 0;
+        let mut cancelled = false;
 
-        // Process the full prompt
-        let token_ids: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
-        let td = TensorData::new(token_ids, [tokens.len()]);
-        let token_tensor = Tensor::<B, 1, Int>::from_data(td, &self.device).unsqueeze::<2>();
+        // Prefill: process prompt tokens (optionally in chunks)
+        let chunk_size = params.prefill_chunk_size.unwrap_or(prompt_len);
+        let chunks: Vec<&[u32]> = tokens.chunks(chunk_size).collect();
+        let num_chunks = chunks.len();
+        let mut pos = 0;
+        let mut last_logits_2d: Option<Tensor<B, 2>> = None;
 
-        let seq_len = tokens.len();
-        let mask = build_causal_mask::<B>(seq_len, seq_len, &self.device);
-        let logits =
-            self.transformer
-                .forward(token_tensor, &self.rope, Some(mask), &mut self.caches, 0);
-
-        // Sample next token from last position's logits
-        let last_logits = logits
-            .slice([0..1, (seq_len - 1)..seq_len, 0..self.config.vocab_size])
-            .reshape([1, self.config.vocab_size]);
-        let mut next_token = sample_token(&last_logits, temperature, sampler);
-        all_tokens.push(next_token);
-        generated_count += 1;
-
-        if next_token == eos_token {
-            let elapsed = start_time.elapsed().as_secs_f64();
-            return GenerationOutput {
-                text: tokenizer.decode(&all_tokens[tokens.len()..]),
-                tokens: generated_count,
-                time: elapsed,
-            };
-        }
-
-        // Autoregressive generation
-        let mut pos = seq_len;
-        for _ in 1..max_new_tokens {
-            let td = TensorData::new(vec![next_token as i32], [1]);
+        for (chunk_idx, chunk) in chunks.iter().enumerate() {
+            let chunk_len = chunk.len();
+            let token_ids: Vec<i32> = chunk.iter().map(|&t| t as i32).collect();
+            let td = TensorData::new(token_ids, [chunk_len]);
             let token_tensor = Tensor::<B, 1, Int>::from_data(td, &self.device).unsqueeze::<2>();
 
-            let total_len = pos + 1;
-            let mask = build_causal_mask::<B>(1, total_len, &self.device);
+            let total_seq_len = pos + chunk_len;
+            let mask = build_causal_mask::<B>(chunk_len, total_seq_len, &self.device);
             let logits = self.transformer.forward(
                 token_tensor,
                 &self.rope,
@@ -381,20 +425,127 @@ impl<B: Backend> Qwen3<B> {
                 pos,
             );
 
-            let logits = logits.reshape([1, self.config.vocab_size]);
-            next_token = sample_token(&logits, temperature, sampler);
-            all_tokens.push(next_token);
-            generated_count += 1;
-            pos += 1;
+            // Keep logits from last chunk's final position for sampling
+            let chunk_last_logits = logits
+                .slice([0..1, (chunk_len - 1)..chunk_len, 0..self.config.vocab_size])
+                .reshape([1, self.config.vocab_size]);
+            last_logits_2d = Some(chunk_last_logits);
 
-            if next_token == eos_token {
+            pos += chunk_len;
+
+            if callback(GenerationEvent::PrefillProgress {
+                chunks_completed: chunk_idx + 1,
+                chunks_total: num_chunks,
+                prompt_tokens: prompt_len,
+            })
+            .is_break()
+            {
+                cancelled = true;
                 break;
             }
         }
 
+        let prefill_time = start_time.elapsed().as_secs_f64();
+
+        if cancelled {
+            let elapsed = start_time.elapsed().as_secs_f64();
+            let _ = callback(GenerationEvent::Done {
+                tokens_generated: 0,
+                total_time_secs: elapsed,
+                prefill_time_secs: prefill_time,
+                stop_reason: StopReason::Cancelled,
+            });
+            return GenerationOutput {
+                text: String::new(),
+                tokens: 0,
+                time: elapsed,
+            };
+        }
+
+        // Sample first token from prefill logits
+        let logits_2d = last_logits_2d.expect("prompt must not be empty");
+        let mut next_token = sample_token(&logits_2d, params.temperature, params.sampler);
+        all_tokens.push(next_token);
+        generated_count += 1;
+
+        let stop_reason = if next_token == eos_token {
+            StopReason::Eos
+        } else {
+            // Emit first token
+            let text = tokenizer.decode(&all_tokens[prompt_len..]);
+            if callback(GenerationEvent::Token {
+                token_id: next_token,
+                text,
+                tokens_generated: generated_count,
+            })
+            .is_break()
+            {
+                let elapsed = start_time.elapsed().as_secs_f64();
+                let _ = callback(GenerationEvent::Done {
+                    tokens_generated: generated_count,
+                    total_time_secs: elapsed,
+                    prefill_time_secs: prefill_time,
+                    stop_reason: StopReason::Cancelled,
+                });
+                return GenerationOutput {
+                    text: tokenizer.decode(&all_tokens[prompt_len..]),
+                    tokens: generated_count,
+                    time: elapsed,
+                };
+            }
+
+            // Autoregressive generation
+            let mut stop = StopReason::MaxTokens;
+            for _ in 1..params.max_new_tokens {
+                let td = TensorData::new(vec![next_token as i32], [1]);
+                let token_tensor =
+                    Tensor::<B, 1, Int>::from_data(td, &self.device).unsqueeze::<2>();
+
+                let total_len = pos + 1;
+                let mask = build_causal_mask::<B>(1, total_len, &self.device);
+                let logits = self.transformer.forward(
+                    token_tensor,
+                    &self.rope,
+                    Some(mask),
+                    &mut self.caches,
+                    pos,
+                );
+
+                let logits = logits.reshape([1, self.config.vocab_size]);
+                next_token = sample_token(&logits, params.temperature, params.sampler);
+                all_tokens.push(next_token);
+                generated_count += 1;
+                pos += 1;
+
+                if next_token == eos_token {
+                    stop = StopReason::Eos;
+                    break;
+                }
+
+                let text = tokenizer.decode(&all_tokens[prompt_len..]);
+                if callback(GenerationEvent::Token {
+                    token_id: next_token,
+                    text,
+                    tokens_generated: generated_count,
+                })
+                .is_break()
+                {
+                    stop = StopReason::Cancelled;
+                    break;
+                }
+            }
+            stop
+        };
+
         let elapsed = start_time.elapsed().as_secs_f64();
+        let _ = callback(GenerationEvent::Done {
+            tokens_generated: generated_count,
+            total_time_secs: elapsed,
+            prefill_time_secs: prefill_time,
+            stop_reason,
+        });
         GenerationOutput {
-            text: tokenizer.decode(&all_tokens[tokens.len()..]),
+            text: tokenizer.decode(&all_tokens[prompt_len..]),
             tokens: generated_count,
             time: elapsed,
         }
@@ -768,5 +919,59 @@ mod tests {
         assert_eq!(c.num_hidden_layers, 94);
         assert_eq!(c.num_experts, Some(128));
         assert!(c.is_moe());
+    }
+
+    #[test]
+    fn stop_reason_eq() {
+        assert_eq!(StopReason::Eos, StopReason::Eos);
+        assert_eq!(StopReason::MaxTokens, StopReason::MaxTokens);
+        assert_eq!(StopReason::Cancelled, StopReason::Cancelled);
+        assert_ne!(StopReason::Eos, StopReason::MaxTokens);
+        assert_ne!(StopReason::Eos, StopReason::Cancelled);
+        assert_ne!(StopReason::MaxTokens, StopReason::Cancelled);
+    }
+
+    #[test]
+    fn generation_event_debug() {
+        let event = GenerationEvent::PrefillProgress {
+            chunks_completed: 1,
+            chunks_total: 3,
+            prompt_tokens: 100,
+        };
+        let s = format!("{:?}", event);
+        assert!(s.contains("PrefillProgress"));
+        assert!(s.contains("100"));
+
+        let event = GenerationEvent::Token {
+            token_id: 42,
+            text: "hello".to_string(),
+            tokens_generated: 5,
+        };
+        let s = format!("{:?}", event);
+        assert!(s.contains("Token"));
+        assert!(s.contains("hello"));
+
+        let event = GenerationEvent::Done {
+            tokens_generated: 10,
+            total_time_secs: 1.5,
+            prefill_time_secs: 0.3,
+            stop_reason: StopReason::Eos,
+        };
+        let s = format!("{:?}", event);
+        assert!(s.contains("Done"));
+        assert!(s.contains("Eos"));
+    }
+
+    #[test]
+    fn generation_params_chunk_size_none_means_no_chunking() {
+        let mut sampler = Sampler::Argmax;
+        let params = GenerationParams {
+            prompt: "test prompt with several tokens",
+            max_new_tokens: 10,
+            temperature: 0.0,
+            sampler: &mut sampler,
+            prefill_chunk_size: None,
+        };
+        assert!(params.prefill_chunk_size.is_none());
     }
 }

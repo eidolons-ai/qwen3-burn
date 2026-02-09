@@ -1,8 +1,9 @@
 use std::io::{self, Write};
+use std::ops::ControlFlow;
 use std::time::Instant;
 
 use clap::Parser;
-use qwen3_burn::model::Qwen3;
+use qwen3_burn::model::{GenerationEvent, GenerationParams, Qwen3};
 use qwen3_burn::sampling::Sampler;
 use qwen3_burn::tokenizer::Qwen3Tokenizer;
 
@@ -36,6 +37,10 @@ struct Args {
     #[arg(long, default_value_t = 2048)]
     max_seq_len: usize,
 
+    /// Prefill chunk size (tokens per chunk; omit for full-prompt prefill)
+    #[arg(long)]
+    chunk_size: Option<usize>,
+
     /// Random seed
     #[arg(long, default_value_t = 42)]
     seed: u64,
@@ -64,26 +69,63 @@ fn run<B: burn::prelude::Backend>(args: Args, device: burn::prelude::Device<B>) 
         Sampler::Argmax
     };
 
-    // Generate
-    let result = model.generate(
+    // Generate with streaming output
+    let mut prev_text_len = 0;
+    let chunk_size = args.chunk_size;
+    let result = model.generate_streaming(
         &tokenizer,
-        &prompt,
-        args.max_tokens,
-        args.temperature,
-        &mut sampler,
+        GenerationParams {
+            prompt: &prompt,
+            max_new_tokens: args.max_tokens,
+            temperature: args.temperature,
+            sampler: &mut sampler,
+            prefill_chunk_size: chunk_size,
+        },
+        |event| {
+            match event {
+                GenerationEvent::PrefillProgress {
+                    chunks_completed,
+                    chunks_total,
+                    ..
+                } => {
+                    if chunks_total > 1 {
+                        eprint!("\rPrefill {}/{}...", chunks_completed, chunks_total);
+                        if chunks_completed == chunks_total {
+                            eprintln!();
+                        }
+                    }
+                }
+                GenerationEvent::Token { ref text, .. } => {
+                    // Print only the newly added characters
+                    let new_text = &text[prev_text_len..];
+                    print!("{}", new_text);
+                    io::stdout().flush().unwrap();
+                    prev_text_len = text.len();
+                }
+                GenerationEvent::Done {
+                    tokens_generated,
+                    total_time_secs,
+                    prefill_time_secs,
+                    stop_reason,
+                } => {
+                    println!();
+                    eprintln!("---");
+                    let decode_time = total_time_secs - prefill_time_secs;
+                    let tps = if decode_time > 0.0 {
+                        tokens_generated as f64 / decode_time
+                    } else {
+                        0.0
+                    };
+                    eprintln!(
+                        "{} tokens generated ({:.2} tokens/s, prefill {:.2}s, stop: {:?})",
+                        tokens_generated, tps, prefill_time_secs, stop_reason
+                    );
+                }
+            }
+            ControlFlow::Continue(())
+        },
     );
-
-    // Print result
-    print!("{}", result.text);
-    io::stdout().flush().unwrap();
-    println!();
-
-    eprintln!("---");
-    eprintln!(
-        "{} tokens generated ({:.2} tokens/s)",
-        result.tokens,
-        result.tokens as f64 / result.time
-    );
+    let _ = result;
 }
 
 fn main() {
