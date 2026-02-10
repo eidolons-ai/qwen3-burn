@@ -418,9 +418,7 @@ impl<B: Backend> MoeLayer<B> {
         let gate_up = x_expanded.matmul(expert_gate_up);
 
         // SwiGLU
-        let gate = gate_up
-            .clone()
-            .slice([0..total_slots, 0..1, 0..moe_i]);
+        let gate = gate_up.clone().slice([0..total_slots, 0..1, 0..moe_i]);
         let up = gate_up.slice([0..total_slots, 0..1, moe_i..2 * moe_i]);
         let hidden_states = activation::silu(gate) * up;
 
@@ -520,8 +518,7 @@ impl<B: Backend> MoeLayer<B> {
                 .unsqueeze_dim::<2>(1);
             let weighted_output = expert_output * weight_tensor;
 
-            let scatter_indices: Vec<i32> =
-                assignments.iter().map(|&(ti, _)| ti as i32).collect();
+            let scatter_indices: Vec<i32> = assignments.iter().map(|&(ti, _)| ti as i32).collect();
             let scatter_tensor = Tensor::<B, 1, Int>::from_data(
                 burn::tensor::TensorData::new(scatter_indices, [n]),
                 &device,
@@ -1138,12 +1135,9 @@ mod tests {
         let dev = device();
         let mut moe = MoeLayer::new(4, 4, 2, 8, true, &dev);
         // Set non-zero weights so output is non-trivial
-        moe.router_weight =
-            Param::from_tensor(Tensor::from_floats([[1., 0., 0., 0.]; 4], &dev));
-        moe.gate_up_proj =
-            Param::from_tensor(Tensor::<B, 3>::ones([4, 4, 16], &dev) * 0.1);
-        moe.down_proj =
-            Param::from_tensor(Tensor::<B, 3>::ones([4, 8, 4], &dev) * 0.1);
+        moe.router_weight = Param::from_tensor(Tensor::from_floats([[1., 0., 0., 0.]; 4], &dev));
+        moe.gate_up_proj = Param::from_tensor(Tensor::<B, 3>::ones([4, 4, 16], &dev) * 0.1);
+        moe.down_proj = Param::from_tensor(Tensor::<B, 3>::ones([4, 8, 4], &dev) * 0.1);
         let x = Tensor::<B, 3>::ones([1, 1, 4], &dev);
         let out = moe.forward(x);
         assert_eq!(out.dims(), [1, 1, 4]);

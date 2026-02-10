@@ -704,8 +704,11 @@ fn load_layer_weights<B: Backend>(
     let q_norm_w = take_tensor_1d(map, &format!("{}.self_attn.q_norm.weight", prefix), device)?;
     let k_norm_w = take_tensor_1d(map, &format!("{}.self_attn.k_norm.weight", prefix), device)?;
     let input_ln_w = take_tensor_1d(map, &format!("{}.input_layernorm.weight", prefix), device)?;
-    let post_attn_ln_w =
-        take_tensor_1d(map, &format!("{}.post_attention_layernorm.weight", prefix), device)?;
+    let post_attn_ln_w = take_tensor_1d(
+        map,
+        &format!("{}.post_attention_layernorm.weight", prefix),
+        device,
+    )?;
 
     if config.is_moe_layer(layer_idx) {
         let num_experts = config.num_experts.unwrap();
@@ -739,8 +742,7 @@ fn load_layer_weights<B: Backend>(
         }
         let down_proj = Tensor::cat(down_experts, 0);
 
-        let router_weight =
-            take_tensor_2d(map, &format!("{}.mlp.gate.weight", prefix), device)?;
+        let router_weight = take_tensor_2d(map, &format!("{}.mlp.gate.weight", prefix), device)?;
 
         Ok(transformer.load_moe_layer(
             layer_idx,
@@ -759,8 +761,7 @@ fn load_layer_weights<B: Backend>(
     } else {
         let gate_proj_w =
             take_linear_weight(map, &format!("{}.mlp.gate_proj.weight", prefix), device)?;
-        let up_proj_w =
-            take_linear_weight(map, &format!("{}.mlp.up_proj.weight", prefix), device)?;
+        let up_proj_w = take_linear_weight(map, &format!("{}.mlp.up_proj.weight", prefix), device)?;
         let down_proj_w =
             take_linear_weight(map, &format!("{}.mlp.down_proj.weight", prefix), device)?;
 
@@ -844,9 +845,7 @@ fn load_safetensors_weights<B: Backend>(
                 let float_data: Vec<f32> = match dtype {
                     safetensors::Dtype::F32 => data
                         .chunks_exact(4)
-                        .map(|chunk| {
-                            f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])
-                        })
+                        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
                         .collect(),
                     safetensors::Dtype::F16 => data
                         .chunks_exact(2)
@@ -858,7 +857,7 @@ fn load_safetensors_weights<B: Backend>(
                         .collect(),
                     _ => {
                         return Err(
-                            format!("Unsupported dtype {:?} for tensor {}", dtype, name).into(),
+                            format!("Unsupported dtype {:?} for tensor {}", dtype, name).into()
                         )
                     }
                 };
@@ -880,9 +879,7 @@ fn load_safetensors_weights<B: Backend>(
         }
 
         // Load any layers whose tensors are now all available.
-        while next_layer < num_layers
-            && layer_tensors_ready(next_layer, config, &tensor_map)
-        {
+        while next_layer < num_layers && layer_tensors_ready(next_layer, config, &tensor_map) {
             if next_layer.is_multiple_of(10) {
                 eprintln!("Loading layer {}/{}...", next_layer, num_layers);
             }
