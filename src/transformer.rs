@@ -367,8 +367,7 @@ impl<B: Backend> MoeLayer<B> {
         // Get top-k expert indices and weights.
         // Uses GPU-native iterated argmax instead of topk_with_indices
         // (see gpu_topk doc comment for rationale, revert target: burn#1490).
-        let (topk_weights, topk_indices) =
-            Self::gpu_topk(router_probs, self.num_experts_per_tok);
+        let (topk_weights, topk_indices) = Self::gpu_topk(router_probs, self.num_experts_per_tok);
 
         // Renormalize weights if configured
         let topk_weights = if self.norm_topk_prob {
@@ -398,10 +397,7 @@ impl<B: Backend> MoeLayer<B> {
     /// For decode (k=8, tensor=`[1, 128]`), this avoids a ~33% MoE time overhead
     /// from the GPU→CPU→GPU roundtrip. Remove this method and revert to
     /// `router_probs.topk_with_indices(k, 1)` once native GPU sort/topk lands.
-    fn gpu_topk(
-        probs: Tensor<B, 2>,
-        k: usize,
-    ) -> (Tensor<B, 2>, Tensor<B, 2, Int>) {
+    fn gpu_topk(probs: Tensor<B, 2>, k: usize) -> (Tensor<B, 2>, Tensor<B, 2, Int>) {
         let device = probs.device();
         let mut probs = probs;
         let mut all_values = Vec::with_capacity(k);
