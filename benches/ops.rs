@@ -249,7 +249,7 @@ fn bench_kv_cache(c: &mut Criterion) {
                     let tensor = Tensor::<B, 4>::ones([1, NUM_KV_HEADS, seq_len, HEAD_DIM], &dev);
                     (cache, tensor)
                 },
-                |(mut cache, tensor)| cache.forward(black_box(tensor)),
+                |(mut cache, tensor): (KvCache<B>, _)| cache.forward(black_box(tensor)),
                 BatchSize::SmallInput,
             )
         });
@@ -266,7 +266,7 @@ fn bench_kv_cache(c: &mut Criterion) {
                     let token = Tensor::<B, 4>::ones([1, NUM_KV_HEADS, 1, HEAD_DIM], &dev);
                     (cache, token)
                 },
-                |(mut cache, token)| cache.forward(black_box(token)),
+                |(mut cache, token): (KvCache<B>, _)| cache.forward(black_box(token)),
                 BatchSize::SmallInput,
             )
         });
