@@ -106,6 +106,11 @@ impl<B: Backend> KvCache<B> {
     pub fn len(&self) -> usize {
         self.cur_seq_len
     }
+
+    #[allow(dead_code)]
+    pub fn is_empty(&self) -> bool {
+        self.cur_seq_len == 0
+    }
 }
 
 #[cfg(test)]
