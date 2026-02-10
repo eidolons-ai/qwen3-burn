@@ -120,7 +120,7 @@ let output = model.generate_streaming(
 
 ## Quantization
 
-Reduce memory usage by quantizing weights after loading:
+Reduce memory usage with INT8/INT4 weight quantization (PackedU32 storage, requires GPU backend):
 
 ```rust
 use qwen3_burn::QuantizationMode;
@@ -130,15 +130,20 @@ let mut model = Qwen3::<Wgpu>::from_pretrained(
     "./models/Qwen3-8B", 2048, QuantizationMode::Int8, &device,
 ).unwrap();
 
-// INT4: ~8x memory reduction (requires WGPU or CUDA backend)
+// INT4: ~8x memory reduction
 let mut model = Qwen3::<Wgpu>::from_pretrained(
     "./models/Qwen3-8B", 2048, QuantizationMode::Int4, &device,
 ).unwrap();
 ```
 
-From the CLI:
+**GGUF auto-quantization**: When loading Q8_0 or Q4_0 GGUF files, quantization is auto-detected — weights are loaded directly into packed quantized format per-tensor, avoiding a full f32 model on GPU. No `--quantize` flag needed:
 
 ```bash
+# Auto-quantized: ~3.2 GB RSS for Qwen3-0.6B Q8_0
+cargo run --release --features wgpu --example chat -- \
+  --model-path ./models/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf --prompt "Hello"
+
+# SafeTensors with explicit quantization
 cargo run --release --features wgpu --example chat -- \
   --model-path ./models/Qwen3-8B --prompt "Hello" --quantize int8
 ```
@@ -146,8 +151,8 @@ cargo run --release --features wgpu --example chat -- \
 | Mode | Memory | Quality | Backend Support |
 |------|--------|---------|-----------------|
 | `none` | Full (FP32) | Best | All |
-| `int8` | ~1/4 | Very good | All |
-| `int4` | ~1/8 | Good | All |
+| `int8` | ~1/4 | Very good | WGPU, CUDA |
+| `int4` | ~1/8 | Good | WGPU, CUDA |
 
 ## Supported Models
 

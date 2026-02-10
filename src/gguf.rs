@@ -344,6 +344,11 @@ impl GgufFile {
         ))
     }
 
+    /// Query the dtype of a tensor by name.
+    pub fn tensor_dtype(&self, name: &str) -> Option<GgufDtype> {
+        self.tensors.get(name).map(|t| t.dtype)
+    }
+
     /// Read and dequantize a tensor's data to f32.
     pub fn read_tensor_data(
         &self,

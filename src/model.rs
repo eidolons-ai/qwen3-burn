@@ -435,11 +435,55 @@ impl<B: Backend> Qwen3<B> {
             device,
         );
 
-        // Load weights from GGUF
-        let transformer = load_gguf_weights(transformer, &gguf_file, &mut file, &config, device)?;
+        // Resolve quantization mode: auto-detect from GGUF if user didn't specify
+        let detected = detect_gguf_quantization(&gguf_file);
+        let resolved_quant = if quantization == QuantizationMode::None {
+            detected
+        } else {
+            quantization
+        };
 
-        // Quantize if requested
-        let transformer = apply_quantization(transformer, quantization);
+        // Build QuantScheme for per-tensor quantized loading
+        let quant_scheme = {
+            use burn::tensor::quantization::{QuantLevel, QuantScheme, QuantValue};
+            match resolved_quant {
+                QuantizationMode::None => None,
+                QuantizationMode::Int8 => {
+                    eprintln!("Loading GGUF with per-tensor INT8 quantization...");
+                    Some(
+                        QuantScheme::default()
+                            .with_value(QuantValue::Q8S)
+                            .with_level(QuantLevel::block([32])),
+                    )
+                }
+                QuantizationMode::Int4 => {
+                    eprintln!("Loading GGUF with per-tensor INT4 quantization...");
+                    Some(
+                        QuantScheme::default()
+                            .with_value(QuantValue::Q4S)
+                            .with_level(QuantLevel::block([32])),
+                    )
+                }
+            }
+        };
+
+        // Load weights from GGUF (per-tensor quantization applied during loading if scheme is set)
+        let per_tensor_quantized = quant_scheme.is_some();
+        let transformer = load_gguf_weights(
+            transformer,
+            &gguf_file,
+            &mut file,
+            &config,
+            quant_scheme,
+            device,
+        )?;
+
+        // Only apply whole-model quantization if per-tensor wasn't already done
+        let transformer = if per_tensor_quantized {
+            transformer
+        } else {
+            apply_quantization(transformer, quantization)
+        };
 
         let rope = RotaryEmbedding::new(config.head_dim, max_seq_len, config.rope_theta, device);
 
@@ -1021,12 +1065,115 @@ fn load_safetensors_weights<B: Backend>(
     Ok(transformer)
 }
 
+/// Quantize f32 data to INT8 symmetric (Q8S) on CPU.
+///
+/// Returns `(int8_values, scales)` where scales has one entry per block.
+/// Each block of `block_size` elements gets `scale = max_abs / 127.0`.
+fn quantize_q8s(data: &[f32], block_size: usize) -> (Vec<i8>, Vec<f32>) {
+    let num_blocks = data.len() / block_size;
+    let mut values = Vec::with_capacity(data.len());
+    let mut scales = Vec::with_capacity(num_blocks);
+
+    for block in data.chunks_exact(block_size) {
+        let max_abs = block.iter().fold(0.0f32, |acc, &v| acc.max(v.abs()));
+        let scale = if max_abs == 0.0 { 1.0 } else { max_abs / 127.0 };
+        scales.push(scale);
+        let inv_scale = 1.0 / scale;
+        for &v in block {
+            let q = (v * inv_scale).round().clamp(-127.0, 127.0) as i8;
+            values.push(q);
+        }
+    }
+
+    (values, scales)
+}
+
+/// Quantize f32 data to INT4 symmetric (Q4S) on CPU.
+///
+/// Returns `(int8_values, scales)` where int8 values are in [-7, 7] range.
+/// Burn's `TensorData::quantized` handles packing i8 into PackedU32 for Q4S.
+fn quantize_q4s(data: &[f32], block_size: usize) -> (Vec<i8>, Vec<f32>) {
+    let num_blocks = data.len() / block_size;
+    let mut values = Vec::with_capacity(data.len());
+    let mut scales = Vec::with_capacity(num_blocks);
+
+    for block in data.chunks_exact(block_size) {
+        let max_abs = block.iter().fold(0.0f32, |acc, &v| acc.max(v.abs()));
+        let scale = if max_abs == 0.0 { 1.0 } else { max_abs / 7.0 };
+        scales.push(scale);
+        let inv_scale = 1.0 / scale;
+        for &v in block {
+            let q = (v * inv_scale).round().clamp(-7.0, 7.0) as i8;
+            values.push(q);
+        }
+    }
+
+    (values, scales)
+}
+
+/// Create a 2D Burn tensor from f32 data, transposing on CPU and quantizing directly.
+///
+/// Input data is in `[out_features, in_features]` (row-major), and the resulting
+/// tensor is `[in_features, out_features]` with quantized storage.
+fn make_2d_quantized<B: Backend>(
+    data: Vec<f32>,
+    shape: &[usize],
+    scheme: &burn::tensor::quantization::QuantScheme,
+    device: &Device<B>,
+) -> Tensor<B, 2> {
+    use burn::tensor::quantization::{QuantLevel, QuantValue};
+
+    let (rows, cols) = (shape[0], shape[1]);
+
+    // Transpose on CPU: [rows, cols] -> [cols, rows]
+    let mut transposed = vec![0.0f32; data.len()];
+    for r in 0..rows {
+        for c in 0..cols {
+            transposed[c * rows + r] = data[r * cols + c];
+        }
+    }
+
+    let block_size = match &scheme.level {
+        QuantLevel::Block(bs) => bs.as_slice()[0] as usize,
+        QuantLevel::Tensor => transposed.len(),
+    };
+
+    let (int8_vals, scales) = match scheme.value {
+        QuantValue::Q8S | QuantValue::Q8F => quantize_q8s(&transposed, block_size),
+        QuantValue::Q4S | QuantValue::Q4F => quantize_q4s(&transposed, block_size),
+        _ => quantize_q8s(&transposed, block_size), // fallback
+    };
+
+    let td = TensorData::quantized(int8_vals, [cols, rows], *scheme, &scales);
+    Tensor::from_data(td, device)
+}
+
+/// Detect quantization mode from GGUF tensor dtypes.
+///
+/// Checks a representative weight tensor to determine the source quantization.
+fn detect_gguf_quantization(gguf_file: &gguf::GgufFile) -> QuantizationMode {
+    // Check the first attention weight tensor
+    let dtype = gguf_file
+        .tensor_dtype("blk.0.attn_q.weight")
+        .or_else(|| gguf_file.tensor_dtype("blk.0.attn_k.weight"));
+
+    match dtype {
+        Some(gguf::GgufDtype::Q8_0) => QuantizationMode::Int8,
+        Some(gguf::GgufDtype::Q4_0) => QuantizationMode::Int4,
+        _ => QuantizationMode::None,
+    }
+}
+
 /// Load GGUF weights into the transformer model.
+///
+/// When `quant_scheme` is `Some`, 2D linear weights are quantized per-tensor on CPU
+/// before being sent to the device, avoiding a full f32 model on GPU.
 fn load_gguf_weights<B: Backend>(
     mut transformer: Transformer<B>,
     gguf_file: &gguf::GgufFile,
     file: &mut std::fs::File,
     config: &Qwen3Config,
+    quant_scheme: Option<burn::tensor::quantization::QuantScheme>,
     device: &Device<B>,
 ) -> Result<Transformer<B>, Box<dyn std::error::Error>> {
     // Helper: read a tensor from GGUF and return as f32 vec with reversed dims (PyTorch convention)
@@ -1054,6 +1201,17 @@ fn load_gguf_weights<B: Backend>(
         Tensor::from_data(TensorData::new(data, [shape[0], shape[1]]), device)
     };
 
+    // Helper: create a 2D linear weight tensor (transposed), quantized if scheme is set.
+    // Input shape is [out, in] (PyTorch convention); result is [in, out] (Burn convention).
+    let make_2d_linear = |data: Vec<f32>, shape: &[usize], device: &Device<B>| -> Tensor<B, 2> {
+        if let Some(ref scheme) = quant_scheme {
+            make_2d_quantized(data, shape, scheme, device)
+        } else {
+            let t = Tensor::from_data(TensorData::new(data, [shape[0], shape[1]]), device);
+            t.transpose()
+        }
+    };
+
     // Helper: create a 3D Burn tensor
     let make_3d = |data: Vec<f32>, shape: &[usize], device: &Device<B>| -> Tensor<B, 3> {
         Tensor::from_data(
@@ -1075,18 +1233,18 @@ fn load_gguf_weights<B: Backend>(
         }
 
         // Attention projections — GGUF stores [out, in] (PyTorch convention after dim reversal),
-        // Burn needs [in, out], so transpose.
+        // Burn needs [in, out], so transpose. When quantizing, this is done on CPU.
         let (q_data, q_shape) = read_tensor(file, &format!("blk.{}.attn_q.weight", i))?;
-        let q_proj_w = make_2d(q_data, &q_shape, device).transpose();
+        let q_proj_w = make_2d_linear(q_data, &q_shape, device);
 
         let (k_data, k_shape) = read_tensor(file, &format!("blk.{}.attn_k.weight", i))?;
-        let k_proj_w = make_2d(k_data, &k_shape, device).transpose();
+        let k_proj_w = make_2d_linear(k_data, &k_shape, device);
 
         let (v_data, v_shape) = read_tensor(file, &format!("blk.{}.attn_v.weight", i))?;
-        let v_proj_w = make_2d(v_data, &v_shape, device).transpose();
+        let v_proj_w = make_2d_linear(v_data, &v_shape, device);
 
         let (o_data, o_shape) = read_tensor(file, &format!("blk.{}.attn_output.weight", i))?;
-        let o_proj_w = make_2d(o_data, &o_shape, device).transpose();
+        let o_proj_w = make_2d_linear(o_data, &o_shape, device);
 
         // QK-Norm weights (1D)
         let (qn_data, _) = read_tensor(file, &format!("blk.{}.attn_q_norm.weight", i))?;
@@ -1144,13 +1302,13 @@ fn load_gguf_weights<B: Backend>(
         } else {
             // Dense layer: individual MLP weights, transpose each [out, in] -> [in, out]
             let (gate_data, gate_shape) = read_tensor(file, &format!("blk.{}.ffn_gate.weight", i))?;
-            let gate_proj_w = make_2d(gate_data, &gate_shape, device).transpose();
+            let gate_proj_w = make_2d_linear(gate_data, &gate_shape, device);
 
             let (up_data, up_shape) = read_tensor(file, &format!("blk.{}.ffn_up.weight", i))?;
-            let up_proj_w = make_2d(up_data, &up_shape, device).transpose();
+            let up_proj_w = make_2d_linear(up_data, &up_shape, device);
 
             let (down_data, down_shape) = read_tensor(file, &format!("blk.{}.ffn_down.weight", i))?;
-            let down_proj_w = make_2d(down_data, &down_shape, device).transpose();
+            let down_proj_w = make_2d_linear(down_data, &down_shape, device);
 
             transformer = transformer.load_layer(
                 i,
@@ -1179,11 +1337,11 @@ fn load_gguf_weights<B: Backend>(
     if config.tie_word_embeddings {
         // Re-read embedding and transpose for lm_head: [vocab, hidden] -> [hidden, vocab]
         let (embed_data, embed_shape) = read_tensor(file, "token_embd.weight")?;
-        let embed_weight = make_2d(embed_data, &embed_shape, device);
-        transformer = transformer.load_lm_head(embed_weight.transpose());
+        let embed_weight = make_2d_linear(embed_data, &embed_shape, device);
+        transformer = transformer.load_lm_head(embed_weight);
     } else {
         let (lm_data, lm_shape) = read_tensor(file, "output.weight")?;
-        let lm_head_weight = make_2d(lm_data, &lm_shape, device).transpose();
+        let lm_head_weight = make_2d_linear(lm_data, &lm_shape, device);
         transformer = transformer.load_lm_head(lm_head_weight);
     }
 
@@ -1558,5 +1716,156 @@ mod tests {
         let mask = build_causal_mask::<B>(3, 3, &dev);
         let out = transformer.forward(tokens, &rope, Some(mask), &mut caches, 0);
         assert_eq!(out.dims(), [1, 3, 100]);
+    }
+
+    #[test]
+    fn quantize_q8s_known_values() {
+        // 32-element block with known max
+        let mut data = vec![0.0f32; 32];
+        data[0] = 127.0;
+        data[1] = -63.5;
+        data[2] = 0.0;
+
+        let (vals, scales) = quantize_q8s(&data, 32);
+        assert_eq!(vals.len(), 32);
+        assert_eq!(scales.len(), 1);
+        // scale = 127.0 / 127.0 = 1.0
+        assert!((scales[0] - 1.0).abs() < 1e-6);
+        assert_eq!(vals[0], 127);
+        assert_eq!(vals[1], -64); // round(-63.5) = -64
+        assert_eq!(vals[2], 0);
+    }
+
+    #[test]
+    fn quantize_q8s_zero_block() {
+        let data = vec![0.0f32; 32];
+        let (vals, scales) = quantize_q8s(&data, 32);
+        assert_eq!(scales.len(), 1);
+        // scale = 1.0 (fallback for zero block)
+        assert!((scales[0] - 1.0).abs() < 1e-6);
+        for &v in &vals {
+            assert_eq!(v, 0);
+        }
+    }
+
+    #[test]
+    fn quantize_q8s_multiple_blocks() {
+        let mut data = vec![0.0f32; 64];
+        data[0] = 25.4; // block 0 max
+        data[32] = -50.8; // block 1 max
+        let (vals, scales) = quantize_q8s(&data, 32);
+        assert_eq!(vals.len(), 64);
+        assert_eq!(scales.len(), 2);
+        assert!((scales[0] - 25.4 / 127.0).abs() < 1e-5);
+        assert!((scales[1] - 50.8 / 127.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn quantize_q4s_known_values() {
+        let mut data = vec![0.0f32; 32];
+        data[0] = 7.0;
+        data[1] = -3.5;
+        data[2] = 0.0;
+
+        let (vals, scales) = quantize_q4s(&data, 32);
+        assert_eq!(vals.len(), 32);
+        assert_eq!(scales.len(), 1);
+        // scale = 7.0 / 7.0 = 1.0
+        assert!((scales[0] - 1.0).abs() < 1e-6);
+        assert_eq!(vals[0], 7);
+        assert_eq!(vals[1], -4); // round(-3.5) = -4
+        assert_eq!(vals[2], 0);
+    }
+
+    #[test]
+    fn quantize_q4s_clamps_to_range() {
+        let mut data = vec![0.0f32; 32];
+        data[0] = 14.0; // scale = 14/7 = 2.0, val = 14/2 = 7 (at range limit)
+        data[1] = -14.0; // val = -14/2 = -7 (at range limit)
+
+        let (vals, scales) = quantize_q4s(&data, 32);
+        assert!((scales[0] - 2.0).abs() < 1e-6);
+        assert_eq!(vals[0], 7);
+        assert_eq!(vals[1], -7);
+    }
+
+    #[test]
+    fn detect_gguf_quantization_q8_0() {
+        use std::collections::HashMap;
+        let mut tensors = HashMap::new();
+        tensors.insert(
+            "blk.0.attn_q.weight".to_string(),
+            crate::gguf::GgufTensorInfo {
+                name: "blk.0.attn_q.weight".to_string(),
+                dims: vec![1024, 1024],
+                dtype: crate::gguf::GgufDtype::Q8_0,
+                offset: 0,
+                num_elements: 1024 * 1024,
+                data_size: 0,
+            },
+        );
+        let gguf = crate::gguf::GgufFile {
+            metadata: HashMap::new(),
+            tensors,
+            tensor_data_offset: 0,
+        };
+        assert_eq!(detect_gguf_quantization(&gguf), QuantizationMode::Int8);
+    }
+
+    #[test]
+    fn detect_gguf_quantization_q4_0() {
+        use std::collections::HashMap;
+        let mut tensors = HashMap::new();
+        tensors.insert(
+            "blk.0.attn_q.weight".to_string(),
+            crate::gguf::GgufTensorInfo {
+                name: "blk.0.attn_q.weight".to_string(),
+                dims: vec![1024, 1024],
+                dtype: crate::gguf::GgufDtype::Q4_0,
+                offset: 0,
+                num_elements: 1024 * 1024,
+                data_size: 0,
+            },
+        );
+        let gguf = crate::gguf::GgufFile {
+            metadata: HashMap::new(),
+            tensors,
+            tensor_data_offset: 0,
+        };
+        assert_eq!(detect_gguf_quantization(&gguf), QuantizationMode::Int4);
+    }
+
+    #[test]
+    fn detect_gguf_quantization_f16_is_none() {
+        use std::collections::HashMap;
+        let mut tensors = HashMap::new();
+        tensors.insert(
+            "blk.0.attn_q.weight".to_string(),
+            crate::gguf::GgufTensorInfo {
+                name: "blk.0.attn_q.weight".to_string(),
+                dims: vec![1024, 1024],
+                dtype: crate::gguf::GgufDtype::F16,
+                offset: 0,
+                num_elements: 1024 * 1024,
+                data_size: 0,
+            },
+        );
+        let gguf = crate::gguf::GgufFile {
+            metadata: HashMap::new(),
+            tensors,
+            tensor_data_offset: 0,
+        };
+        assert_eq!(detect_gguf_quantization(&gguf), QuantizationMode::None);
+    }
+
+    #[test]
+    fn detect_gguf_quantization_empty_is_none() {
+        use std::collections::HashMap;
+        let gguf = crate::gguf::GgufFile {
+            metadata: HashMap::new(),
+            tensors: HashMap::new(),
+            tensor_data_offset: 0,
+        };
+        assert_eq!(detect_gguf_quantization(&gguf), QuantizationMode::None);
     }
 }
