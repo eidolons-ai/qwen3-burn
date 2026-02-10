@@ -115,8 +115,9 @@ Criterion benchmarks (`benches/ops.rs`) measure all core ops parameterized by se
 - `Mlp` enum (`Dense`/`Moe`) makes TransformerBlock polymorphic — each layer is independently dense or MoE
 - `MoeLayer` stores packed 3D expert weights (gate_up_proj, down_proj) and a 2D router weight
 - During loading, per-expert 2D weights from safetensors are transposed and packed into 3D tensors: gate_proj + up_proj → `gate_up_proj` [num_experts, hidden, 2*moe_intermediate], down_proj → `down_proj` [num_experts, moe_intermediate, hidden]
-- Forward: router softmax → top-k selection → optional renormalization (`norm_topk_prob`) → per-expert gather/SwiGLU/scatter
-- Expert routing iterates over experts on CPU (index selection), dispatches GPU matmuls per active expert — functional but slow for large models (see Performance)
+- Forward: router softmax → top-k selection → optional renormalization (`norm_topk_prob`) → two-path dispatch based on token count
+- **Batched decode path** (`forward_batched`): for `num_tokens <= num_experts_per_tok` (decode is always 1 token). Uses GPU-side `select(0, ...)` to gather top-k expert weights, then runs a single batched matmul across all k experts simultaneously. ~6 GPU dispatches per layer instead of ~40. No CPU roundtrip for expert indices.
+- **Per-expert prefill path** (`forward_per_expert`): for prefill (many tokens). Builds a dispatch table via `HashMap<expert_idx, Vec<(token_idx, weight)>>` in one pass, then iterates only active experts (typically 8-30 unique for a short prefill) instead of all 128.
 - `Qwen3Config::is_moe_layer(i)` determines per-layer type via `decoder_sparse_step` and `mlp_only_layers`
 
 ## Model Sizes
