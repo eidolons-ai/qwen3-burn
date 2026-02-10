@@ -364,9 +364,11 @@ impl<B: Backend> MoeLayer<B> {
         let router_logits = x_flat.clone().matmul(self.router_weight.val().transpose());
         let router_probs = activation::softmax(router_logits, 1);
 
-        // Get top-k expert indices and weights
+        // Get top-k expert indices and weights.
+        // Uses GPU-native iterated argmax instead of topk_with_indices
+        // (see gpu_topk doc comment for rationale, revert target: burn#1490).
         let (topk_weights, topk_indices) =
-            router_probs.topk_with_indices(self.num_experts_per_tok, 1);
+            Self::gpu_topk(router_probs, self.num_experts_per_tok);
 
         // Renormalize weights if configured
         let topk_weights = if self.norm_topk_prob {
@@ -384,6 +386,38 @@ impl<B: Backend> MoeLayer<B> {
         };
 
         output.reshape([batch, seq_len, hidden])
+    }
+
+    /// GPU-native top-k via iterated argmax.
+    ///
+    /// WORKAROUND for burn#1490: `topk_with_indices` falls back to CPU sort on
+    /// cubecl backends (WGPU, CUDA), causing a full GPU pipeline drain per call.
+    /// This replaces it with k iterations of `argmax` (a GPU-native reduction),
+    /// each masking the selected index to -inf before the next iteration.
+    ///
+    /// For decode (k=8, tensor=`[1, 128]`), this avoids a ~33% MoE time overhead
+    /// from the GPU→CPU→GPU roundtrip. Remove this method and revert to
+    /// `router_probs.topk_with_indices(k, 1)` once native GPU sort/topk lands.
+    fn gpu_topk(
+        probs: Tensor<B, 2>,
+        k: usize,
+    ) -> (Tensor<B, 2>, Tensor<B, 2, Int>) {
+        let device = probs.device();
+        let mut probs = probs;
+        let mut all_values = Vec::with_capacity(k);
+        let mut all_indices = Vec::with_capacity(k);
+
+        for _ in 0..k {
+            let idx = probs.clone().argmax(1); // [T, 1]
+            let val = probs.clone().gather(1, idx.clone()); // [T, 1]
+            all_values.push(val);
+            all_indices.push(idx.clone());
+            // Mask selected position to -inf for next iteration
+            let mask = Tensor::<B, 2>::zeros(idx.dims(), &device) + f32::NEG_INFINITY;
+            probs = probs.scatter(1, idx, mask, IndexingUpdateOp::Add);
+        }
+
+        (Tensor::cat(all_values, 1), Tensor::cat(all_indices, 1))
     }
 
     /// Batched decode path: selects top-k expert weights via GPU gather and runs
