@@ -35,7 +35,9 @@ benches/
 
 ## Weight Loading
 
-PyTorch stores Linear weights as `[out_features, in_features]`; Burn stores as `[in_features, out_features]`. All Linear weights are **transposed** during loading (`get_linear_weight`). Embedding weights are loaded without transpose (`get_tensor_2d_raw`). When `tie_word_embeddings=true`, the embedding weight is transposed and used as the lm_head weight.
+PyTorch stores Linear weights as `[out_features, in_features]`; Burn stores as `[in_features, out_features]`. All Linear weights are **transposed** during loading (`take_linear_weight`). Embedding weights are loaded without transpose (`take_tensor_2d`). When `tie_word_embeddings=true`, the embedding weight is transposed and used as the lm_head weight.
+
+Weight loading streams shard-by-shard: after reading each safetensors file, completed layers are loaded into the model immediately and their f32 data is freed via `remove()` from the tensor map. This keeps peak memory close to the final model size (~1x) rather than ~2-3x.
 
 SafeTensors key mapping (dense layers):
 - `model.embed_tokens.weight` -> Embedding
@@ -47,9 +49,10 @@ SafeTensors key mapping (dense layers):
 - `lm_head.weight` -> Linear (transposed, or tied with embedding)
 
 SafeTensors key mapping (MoE layers):
-- `model.layers.{i}.mlp.experts.gate_up_proj` -> 3D `[num_experts, 2*moe_intermediate, hidden]` (per-expert transposed via swap_dims)
-- `model.layers.{i}.mlp.experts.down_proj` -> 3D `[num_experts, hidden, moe_intermediate]` (per-expert transposed via swap_dims)
-- `model.layers.{i}.mlp.router.weight` -> 2D `[num_experts, hidden]` (no transpose)
+- `model.layers.{i}.mlp.experts.{j}.gate_proj.weight` -> 2D `[moe_intermediate, hidden]` (per-expert, transposed and packed with up_proj into 3D gate_up_proj)
+- `model.layers.{i}.mlp.experts.{j}.up_proj.weight` -> 2D `[moe_intermediate, hidden]` (per-expert, transposed and packed with gate_proj)
+- `model.layers.{i}.mlp.experts.{j}.down_proj.weight` -> 2D `[hidden, moe_intermediate]` (per-expert, transposed and stacked into 3D)
+- `model.layers.{i}.mlp.gate.weight` -> 2D `[num_experts, hidden]` (router, no transpose)
 
 ## Build & Test
 
@@ -111,8 +114,9 @@ Criterion benchmarks (`benches/ops.rs`) measure all core ops parameterized by se
 
 - `Mlp` enum (`Dense`/`Moe`) makes TransformerBlock polymorphic — each layer is independently dense or MoE
 - `MoeLayer` stores packed 3D expert weights (gate_up_proj, down_proj) and a 2D router weight
+- During loading, per-expert 2D weights from safetensors are transposed and packed into 3D tensors: gate_proj + up_proj → `gate_up_proj` [num_experts, hidden, 2*moe_intermediate], down_proj → `down_proj` [num_experts, moe_intermediate, hidden]
 - Forward: router softmax → top-k selection → optional renormalization (`norm_topk_prob`) → per-expert gather/SwiGLU/scatter
-- Expert routing iterates over experts on CPU (index selection), dispatches GPU matmuls per active expert
+- Expert routing iterates over experts on CPU (index selection), dispatches GPU matmuls per active expert — functional but slow for large models (see Performance)
 - `Qwen3Config::is_moe_layer(i)` determines per-layer type via `decoder_sparse_step` and `mlp_only_layers`
 
 ## Model Sizes
