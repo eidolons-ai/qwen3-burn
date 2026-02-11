@@ -7,7 +7,9 @@
 // each forward call inside `b.iter()` to ensure GPU work completes before timing
 // stops. NdArray is synchronous so no sync is needed here.
 
-use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion};
+use std::hint::black_box;
+
+use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
 
 use burn::backend::NdArray;
 use burn::prelude::*;
