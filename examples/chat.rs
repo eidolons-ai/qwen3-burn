@@ -143,12 +143,14 @@ fn run<B: burn::prelude::Backend>(args: Args, device: burn::prelude::Device<B>) 
                     }
                 }
                 GenerationEvent::Token { ref text, .. } => {
-                    // Print only the newly added characters (char-boundary safe)
-                    if prev_text_len <= text.len() {
+                    // Print only newly added characters, skipping trailing U+FFFD
+                    // from incomplete multi-byte sequences (e.g. emoji split across tokens)
+                    let stable_end = text.trim_end_matches('\u{FFFD}').len();
+                    if stable_end > prev_text_len {
                         let start = text.floor_char_boundary(prev_text_len);
-                        print!("{}", &text[start..]);
+                        print!("{}", &text[start..stable_end]);
                         io::stdout().flush().unwrap();
-                        prev_text_len = text.len();
+                        prev_text_len = stable_end;
                     }
                 }
                 GenerationEvent::Done {
