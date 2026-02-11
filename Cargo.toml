@@ -12,6 +12,7 @@ wgpu = ["burn/wgpu"]
 ndarray = ["burn/ndarray"]
 cuda = ["burn/cuda"]
 bench = []
+profile = ["tracing-subscriber"]
 
 [[example]]
 name = "chat"
@@ -24,6 +25,8 @@ serde_json = "1.0"
 tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
 rand = "0.8"
 half = { version = "2.4", features = ["serde"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", optional = true }
 
 [dev-dependencies]
 clap = { version = "4", features = ["derive"] }

@@ -360,28 +360,35 @@ impl<B: Backend> MoeLayer<B> {
         // Flatten to [num_tokens, hidden]
         let x_flat = x.reshape([num_tokens, hidden]);
 
-        // Router logits: [num_tokens, hidden] @ [hidden, num_experts] -> [num_tokens, num_experts]
-        let router_logits = x_flat.clone().matmul(self.router_weight.val().transpose());
-        let router_probs = activation::softmax(router_logits, 1);
-
-        // Get top-k expert indices and weights.
-        // Uses GPU-native iterated argmax instead of topk_with_indices
-        // (see gpu_topk doc comment for rationale, revert target: burn#1490).
-        let (topk_weights, topk_indices) = Self::gpu_topk(router_probs, self.num_experts_per_tok);
-
-        // Renormalize weights if configured
-        let topk_weights = if self.norm_topk_prob {
-            let sum = topk_weights.clone().sum_dim(1);
-            topk_weights / sum
-        } else {
-            topk_weights
+        // Router + top-k selection
+        let (topk_weights, topk_indices) = {
+            let _span = tracing::info_span!("router").entered();
+            let router_logits = x_flat.clone().matmul(self.router_weight.val().transpose());
+            let router_probs = activation::softmax(router_logits, 1);
+            let (topk_weights, topk_indices) =
+                Self::gpu_topk(router_probs, self.num_experts_per_tok);
+            let topk_weights = if self.norm_topk_prob {
+                let sum = topk_weights.clone().sum_dim(1);
+                topk_weights / sum
+            } else {
+                topk_weights
+            };
+            (topk_weights, topk_indices)
         };
 
         // Dispatch: batched GPU path for decode, per-expert path for prefill
-        let output = if num_tokens <= self.num_experts_per_tok {
-            self.forward_batched(x_flat, topk_weights, topk_indices)
+        let path = if num_tokens <= self.num_experts_per_tok {
+            "batched"
         } else {
-            self.forward_per_expert(x_flat, topk_weights, topk_indices)
+            "per_expert"
+        };
+        let output = {
+            let _span = tracing::info_span!("dispatch", path).entered();
+            if num_tokens <= self.num_experts_per_tok {
+                self.forward_batched(x_flat, topk_weights, topk_indices)
+            } else {
+                self.forward_per_expert(x_flat, topk_weights, topk_indices)
+            }
         };
 
         output.reshape([batch, seq_len, hidden])
@@ -656,16 +663,22 @@ impl<B: Backend> TransformerBlock<B> {
         start_pos: usize,
     ) -> Tensor<B, 3> {
         // Pre-norm attention with residual
-        let residual = x.clone();
-        let x = self.input_layernorm.forward(x);
-        let x = self.self_attn.forward(x, rope, mask, cache, start_pos);
-        let x = x + residual;
+        let x = {
+            let _span = tracing::info_span!("attention").entered();
+            let residual = x.clone();
+            let h = self.input_layernorm.forward(x);
+            let h = self.self_attn.forward(h, rope, mask, cache, start_pos);
+            h + residual
+        };
 
         // Pre-norm FFN with residual
-        let residual = x.clone();
-        let x = self.post_attention_layernorm.forward(x);
-        let x = self.mlp.forward(x);
-        x + residual
+        {
+            let _span = tracing::info_span!("mlp").entered();
+            let residual = x.clone();
+            let h = self.post_attention_layernorm.forward(x);
+            let h = self.mlp.forward(h);
+            h + residual
+        }
     }
 }
 
@@ -778,11 +791,24 @@ impl<B: Backend> Transformer<B> {
         let mut x = self.embed_tokens.forward(tokens);
 
         for (i, layer) in self.layers.iter().enumerate() {
+            let kind = match &layer.mlp {
+                Mlp::Dense(_) => "dense",
+                Mlp::Moe(_) => "moe",
+            };
+            let _span = tracing::info_span!("layer", i, kind).entered();
             x = layer.forward(x, rope, mask.clone(), &mut caches[i], start_pos);
+            #[cfg(feature = "profile")]
+            let _ = B::sync(&x.device());
         }
 
-        x = self.norm.forward(x);
-        self.lm_head.forward(x)
+        {
+            let _span = tracing::info_span!("norm_and_head").entered();
+            x = self.norm.forward(x);
+            let out = self.lm_head.forward(x);
+            #[cfg(feature = "profile")]
+            let _ = B::sync(&out.device());
+            out
+        }
     }
 
     // --- Weight loading methods ---

@@ -135,6 +135,16 @@ fn run<B: burn::prelude::Backend>(args: Args, device: burn::prelude::Device<B>) 
 }
 
 fn main() {
+    #[cfg(feature = "profile")]
+    {
+        use tracing_subscriber::fmt::format::FmtSpan;
+        tracing_subscriber::fmt()
+            .pretty()
+            .with_span_events(FmtSpan::CLOSE)
+            .with_target(false)
+            .init();
+    }
+
     let args = Args::parse();
 
     #[cfg(feature = "wgpu")]

@@ -529,6 +529,7 @@ impl<B: Backend> Qwen3<B> {
             // attends to all cached positions, so the mask would be all-zeros.
             let mut stop = StopReason::MaxTokens;
             for _ in 1..params.max_new_tokens {
+                let _span = tracing::info_span!("decode_step", pos).entered();
                 let td = TensorData::new(vec![next_token as i32], [1]);
                 let token_tensor =
                     Tensor::<B, 1, Int>::from_data(td, &self.device).unsqueeze::<2>();
