@@ -119,6 +119,24 @@ fn rotate_half<B: Backend>(x: Tensor<B, 4>) -> Tensor<B, 4> {
     Tensor::cat(vec![x2.neg(), x1], 3)
 }
 
+/// Apply rotary embeddings to query and key tensors using explicit cos/sin.
+///
+/// - `q`, `k`: `[batch, num_heads, seq_len, head_dim]`
+/// - `cos`, `sin`: `[seq_len, head_dim]` (will be broadcast)
+#[allow(dead_code)]
+pub fn apply_rotary<B: Backend>(
+    q: Tensor<B, 4>,
+    k: Tensor<B, 4>,
+    cos: Tensor<B, 2>,
+    sin: Tensor<B, 2>,
+) -> (Tensor<B, 4>, Tensor<B, 4>) {
+    let cos = cos.unsqueeze::<3>().unsqueeze::<4>();
+    let sin = sin.unsqueeze::<3>().unsqueeze::<4>();
+    let q_embed = q.clone() * cos.clone() + rotate_half(q) * sin.clone();
+    let k_embed = k.clone() * cos + rotate_half(k) * sin;
+    (q_embed, k_embed)
+}
+
 /// Multi-head attention with grouped-query attention and QK-Norm.
 #[derive(Module, Debug)]
 pub struct MultiHeadAttention<B: Backend> {
@@ -263,6 +281,71 @@ impl<B: Backend> MultiHeadAttention<B> {
         let attn_output = attn_weights.matmul(v);
 
         // Reshape back to [batch, seq_len, d_model]
+        let attn_output =
+            attn_output
+                .swap_dims(1, 2)
+                .reshape([batch, seq_len, self.num_heads * self.head_dim]);
+
+        self.o_proj.forward(attn_output)
+    }
+
+    /// Forward pass with explicit cos/sin instead of RotaryEmbedding.
+    ///
+    /// Used by Qwen3-VL where mRoPE provides cos/sin externally.
+    pub fn forward_with_cos_sin(
+        &self,
+        x: Tensor<B, 3>,
+        cos: Tensor<B, 2>,
+        sin: Tensor<B, 2>,
+        mask: Option<Tensor<B, 2>>,
+        cache: &mut AttentionKvCache<B>,
+    ) -> Tensor<B, 3> {
+        let [batch, seq_len, _d_model] = x.dims();
+
+        let q = self.q_proj.forward(x.clone());
+        let k = self.k_proj.forward(x.clone());
+        let v = self.v_proj.forward(x);
+
+        let q = q.reshape([batch, seq_len, self.num_heads, self.head_dim]);
+        let k = k.reshape([batch, seq_len, self.num_kv_heads, self.head_dim]);
+        let v = v.reshape([batch, seq_len, self.num_kv_heads, self.head_dim]);
+
+        // QK-Norm
+        let q = self
+            .q_norm
+            .forward(q.reshape([batch * seq_len * self.num_heads, 1, self.head_dim]))
+            .reshape([batch, seq_len, self.num_heads, self.head_dim]);
+        let k = self
+            .k_norm
+            .forward(k.reshape([batch * seq_len * self.num_kv_heads, 1, self.head_dim]))
+            .reshape([batch, seq_len, self.num_kv_heads, self.head_dim]);
+
+        let q = q.swap_dims(1, 2);
+        let k = k.swap_dims(1, 2);
+        let v = v.swap_dims(1, 2);
+
+        // Apply RoPE with explicit cos/sin
+        let (q, k) = apply_rotary(q, k, cos, sin);
+
+        let k = cache.k_cache.forward(k);
+        let v = cache.v_cache.forward(v);
+
+        let num_kv_groups = self.num_heads / self.num_kv_heads;
+        let k = repeat_kv(k, num_kv_groups);
+        let v = repeat_kv(v, num_kv_groups);
+
+        let scale = (self.head_dim as f64).sqrt().recip();
+        let attn_weights = q.matmul(k.transpose()) * scale;
+
+        let attn_weights = if let Some(mask) = mask {
+            attn_weights + mask.unsqueeze::<3>().unsqueeze::<4>()
+        } else {
+            attn_weights
+        };
+
+        let attn_weights = activation::softmax(attn_weights, 3);
+        let attn_output = attn_weights.matmul(v);
+
         let attn_output =
             attn_output
                 .swap_dims(1, 2)
@@ -688,6 +771,34 @@ impl<B: Backend> TransformerBlock<B> {
             h + residual
         }
     }
+
+    /// Forward pass with explicit cos/sin (for Qwen3-VL mRoPE).
+    pub fn forward_with_cos_sin(
+        &self,
+        x: Tensor<B, 3>,
+        cos: Tensor<B, 2>,
+        sin: Tensor<B, 2>,
+        mask: Option<Tensor<B, 2>>,
+        cache: &mut AttentionKvCache<B>,
+    ) -> Tensor<B, 3> {
+        let x = {
+            let _span = tracing::info_span!("attention").entered();
+            let residual = x.clone();
+            let h = self.input_layernorm.forward(x);
+            let h = self
+                .self_attn
+                .forward_with_cos_sin(h, cos, sin, mask, cache);
+            h + residual
+        };
+
+        {
+            let _span = tracing::info_span!("mlp").entered();
+            let residual = x.clone();
+            let h = self.post_attention_layernorm.forward(x);
+            let h = self.mlp.forward(h);
+            h + residual
+        }
+    }
 }
 
 /// Full Qwen3 transformer model.
@@ -817,6 +928,75 @@ impl<B: Backend> Transformer<B> {
             let _ = B::sync(&out.device());
             out
         }
+    }
+
+    /// Forward pass from pre-computed embeddings with explicit cos/sin (for Qwen3-VL).
+    ///
+    /// Skips `embed_tokens` since embeddings are already computed (with vision tokens injected).
+    /// Supports optional DeepStack injection of vision features into early layers.
+    ///
+    /// - `embeddings`: `[batch, seq, hidden]`
+    /// - `cos`, `sin`: `[seq, head_dim]` from mRoPE
+    /// - `mask`: optional causal mask
+    /// - `caches`: KV caches for each layer
+    /// - `deepstack`: optional `(features, visual_mask)` for DeepStack injection
+    ///   - `features`: slice of tensors, one per DeepStack layer
+    ///   - `visual_mask`: `[batch, seq, hidden]` float mask (1.0 at vision positions, 0.0 elsewhere)
+    ///   - `deepstack_layers`: which LLM layer indices receive DeepStack residuals
+    #[allow(clippy::type_complexity)]
+    pub fn forward_from_embeddings(
+        &self,
+        embeddings: Tensor<B, 3>,
+        cos: Tensor<B, 2>,
+        sin: Tensor<B, 2>,
+        mask: Option<Tensor<B, 2>>,
+        caches: &mut [AttentionKvCache<B>],
+        deepstack: Option<(&[Tensor<B, 3>], Tensor<B, 3>, &[usize])>,
+    ) -> Tensor<B, 3> {
+        let mut x = embeddings;
+
+        for (i, layer) in self.layers.iter().enumerate() {
+            let kind = match &layer.mlp {
+                Mlp::Dense(_) => "dense",
+                Mlp::Moe(_) => "moe",
+            };
+            let _span = tracing::info_span!("layer", i, kind).entered();
+            x = layer.forward_with_cos_sin(
+                x,
+                cos.clone(),
+                sin.clone(),
+                mask.clone(),
+                &mut caches[i],
+            );
+
+            // DeepStack injection: add vision features as residual at specified layers
+            if let Some((features, ref visual_mask, ds_layers)) = deepstack {
+                if let Some(ds_idx) = ds_layers.iter().position(|&l| l == i) {
+                    if ds_idx < features.len() {
+                        // features[ds_idx]: [batch, seq, hidden] (zero at non-vision positions)
+                        // visual_mask: [batch, seq, hidden] (1.0 at vision positions, 0.0 elsewhere)
+                        x = x + features[ds_idx].clone() * visual_mask.clone();
+                    }
+                }
+            }
+
+            #[cfg(feature = "profile")]
+            let _ = B::sync(&x.device());
+        }
+
+        {
+            let _span = tracing::info_span!("norm_and_head").entered();
+            x = self.norm.forward(x);
+            let out = self.lm_head.forward(x);
+            #[cfg(feature = "profile")]
+            let _ = B::sync(&out.device());
+            out
+        }
+    }
+
+    /// Access to embed_tokens for use by VL model.
+    pub fn embed_tokens(&self) -> &Embedding<B> {
+        &self.embed_tokens
     }
 
     // --- Weight loading methods ---
