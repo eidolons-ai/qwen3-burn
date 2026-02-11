@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use burn::module::Param;
 use burn::nn::Embedding;
 use burn::prelude::*;
@@ -362,10 +364,10 @@ impl<B: Backend> MoeLayer<B> {
         let router_logits = x_flat.clone().matmul(self.router_weight.val().transpose());
         let router_probs = activation::softmax(router_logits, 1);
 
-        // Get top-k expert indices and weights
-        // topk returns (values, indices) with shape [num_tokens, k]
-        let (topk_weights, topk_indices) =
-            router_probs.topk_with_indices(self.num_experts_per_tok, 1);
+        // Get top-k expert indices and weights.
+        // Uses GPU-native iterated argmax instead of topk_with_indices
+        // (see gpu_topk doc comment for rationale, revert target: burn#1490).
+        let (topk_weights, topk_indices) = Self::gpu_topk(router_probs, self.num_experts_per_tok);
 
         // Renormalize weights if configured
         let topk_weights = if self.norm_topk_prob {
@@ -375,41 +377,133 @@ impl<B: Backend> MoeLayer<B> {
             topk_weights
         };
 
-        // Process each expert: gather tokens, compute SwiGLU, scatter back
-        // Initialize output as zeros
+        // Dispatch: batched GPU path for decode, per-expert path for prefill
+        let output = if num_tokens <= self.num_experts_per_tok {
+            self.forward_batched(x_flat, topk_weights, topk_indices)
+        } else {
+            self.forward_per_expert(x_flat, topk_weights, topk_indices)
+        };
+
+        output.reshape([batch, seq_len, hidden])
+    }
+
+    /// GPU-native top-k via iterated argmax.
+    ///
+    /// WORKAROUND for burn#1490: `topk_with_indices` falls back to CPU sort on
+    /// cubecl backends (WGPU, CUDA), causing a full GPU pipeline drain per call.
+    /// This replaces it with k iterations of `argmax` (a GPU-native reduction),
+    /// each masking the selected index to -inf before the next iteration.
+    ///
+    /// For decode (k=8, tensor=`[1, 128]`), this avoids a ~33% MoE time overhead
+    /// from the GPU→CPU→GPU roundtrip. Remove this method and revert to
+    /// `router_probs.topk_with_indices(k, 1)` once native GPU sort/topk lands.
+    fn gpu_topk(probs: Tensor<B, 2>, k: usize) -> (Tensor<B, 2>, Tensor<B, 2, Int>) {
+        let device = probs.device();
+        let mut probs = probs;
+        let mut all_values = Vec::with_capacity(k);
+        let mut all_indices = Vec::with_capacity(k);
+
+        for _ in 0..k {
+            let idx = probs.clone().argmax(1); // [T, 1]
+            let val = probs.clone().gather(1, idx.clone()); // [T, 1]
+            all_values.push(val);
+            all_indices.push(idx.clone());
+            // Mask selected position to -inf for next iteration
+            let mask = Tensor::<B, 2>::zeros(idx.dims(), &device) + f32::NEG_INFINITY;
+            probs = probs.scatter(1, idx, mask, IndexingUpdateOp::Add);
+        }
+
+        (Tensor::cat(all_values, 1), Tensor::cat(all_indices, 1))
+    }
+
+    /// Batched decode path: selects top-k expert weights via GPU gather and runs
+    /// a single batched matmul instead of k serial dispatches.
+    ///
+    /// Efficient for small token counts (decode), where num_tokens * k is small.
+    fn forward_batched(
+        &self,
+        x_flat: Tensor<B, 2>,
+        topk_weights: Tensor<B, 2>,
+        topk_indices: Tensor<B, 2, Int>,
+    ) -> Tensor<B, 2> {
+        let [num_tokens, k] = topk_weights.dims();
+        let hidden = x_flat.dims()[1];
+        let total_slots = num_tokens * k;
+        let moe_i = self.moe_intermediate_size;
+
+        // Flatten expert indices for GPU gather: [total_slots]
+        let flat_indices = topk_indices.reshape([total_slots]);
+
+        // Select active expert weights: [total_slots, H, 2*I] and [total_slots, I, H]
+        let expert_gate_up = self.gate_up_proj.val().select(0, flat_indices.clone());
+        let expert_down = self.down_proj.val().select(0, flat_indices);
+
+        // Expand input: each token repeated k times → [total_slots, 1, H]
+        let x_expanded = x_flat
+            .unsqueeze_dim::<3>(1) // [T, 1, H]
+            .expand([num_tokens, k, hidden]) // [T, K, H]
+            .reshape([total_slots, 1, hidden]); // [T*K, 1, H]
+
+        // Batched gate_up: [T*K, 1, H] @ [T*K, H, 2*I] → [T*K, 1, 2*I]
+        let gate_up = x_expanded.matmul(expert_gate_up);
+
+        // SwiGLU
+        let gate = gate_up.clone().slice([0..total_slots, 0..1, 0..moe_i]);
+        let up = gate_up.slice([0..total_slots, 0..1, moe_i..2 * moe_i]);
+        let hidden_states = activation::silu(gate) * up;
+
+        // Batched down_proj: [T*K, 1, I] @ [T*K, I, H] → [T*K, 1, H]
+        let expert_output = hidden_states.matmul(expert_down);
+
+        // Reshape to [T, K, H] for weighted sum
+        let expert_output = expert_output.reshape([num_tokens, k, hidden]);
+
+        // Weight by router probs: [T, K, 1] * [T, K, H] → sum over K → [T, H]
+        let weights = topk_weights.unsqueeze_dim::<3>(2);
+        (expert_output * weights)
+            .sum_dim(1)
+            .reshape([num_tokens, hidden])
+    }
+
+    /// Per-expert dispatch path for prefill: builds a dispatch table in one pass
+    /// and iterates only over active experts (not all num_experts).
+    fn forward_per_expert(
+        &self,
+        x_flat: Tensor<B, 2>,
+        topk_weights: Tensor<B, 2>,
+        topk_indices: Tensor<B, 2, Int>,
+    ) -> Tensor<B, 2> {
+        let [num_tokens, _k] = topk_weights.dims();
+        let hidden = x_flat.dims()[1];
         let device = x_flat.device();
         let mut output = Tensor::<B, 2>::zeros([num_tokens, hidden], &device);
 
-        // Convert topk_indices to data for CPU-side iteration over experts
+        // CPU sync for dispatch table
         let indices_data = topk_indices.to_data();
         let indices_vec: Vec<i64> = indices_data.iter::<i64>().collect();
         let weights_data = topk_weights.to_data();
         let weights_vec: Vec<f32> = weights_data.iter::<f32>().collect();
 
-        // For each expert, find which (token, slot) pairs route to it
-        for expert_idx in 0..self.num_experts {
-            // Collect token indices that route to this expert
-            let mut token_indices = Vec::new();
-            let mut token_weights = Vec::new();
-
-            for token_idx in 0..num_tokens {
-                for slot in 0..self.num_experts_per_tok {
-                    let idx = token_idx * self.num_experts_per_tok + slot;
-                    if indices_vec[idx] == expert_idx as i64 {
-                        token_indices.push(token_idx);
-                        token_weights.push(weights_vec[idx]);
-                    }
-                }
+        // Build dispatch table in one pass: expert_idx → Vec<(token_idx, weight)>
+        let mut dispatch: HashMap<usize, Vec<(usize, f32)>> = HashMap::new();
+        for token_idx in 0..num_tokens {
+            for slot in 0..self.num_experts_per_tok {
+                let idx = token_idx * self.num_experts_per_tok + slot;
+                let expert_idx = indices_vec[idx] as usize;
+                let weight = weights_vec[idx];
+                dispatch
+                    .entry(expert_idx)
+                    .or_default()
+                    .push((token_idx, weight));
             }
+        }
 
-            if token_indices.is_empty() {
-                continue;
-            }
-
-            let n = token_indices.len();
+        // Iterate only active experts
+        for (expert_idx, assignments) in &dispatch {
+            let n = assignments.len();
 
             // Gather tokens for this expert: [n, hidden]
-            let gather_indices: Vec<i32> = token_indices.iter().map(|&i| i as i32).collect();
+            let gather_indices: Vec<i32> = assignments.iter().map(|&(ti, _)| ti as i32).collect();
             let gather_tensor = Tensor::<B, 1, Int>::from_data(
                 burn::tensor::TensorData::new(gather_indices, [n]),
                 &device,
@@ -417,30 +511,27 @@ impl<B: Backend> MoeLayer<B> {
             let expert_input = x_flat.clone().select(0, gather_tensor);
 
             // Slice this expert's weights
-            // gate_up_proj: [num_experts, hidden, 2*moe_intermediate] -> [hidden, 2*moe_intermediate]
             let expert_gate_up = self
                 .gate_up_proj
                 .val()
                 .slice([
-                    expert_idx..expert_idx + 1,
+                    *expert_idx..*expert_idx + 1,
                     0..hidden,
                     0..2 * self.moe_intermediate_size,
                 ])
                 .reshape([hidden, 2 * self.moe_intermediate_size]);
 
-            // down_proj: [num_experts, moe_intermediate, hidden] -> [moe_intermediate, hidden]
             let expert_down = self
                 .down_proj
                 .val()
                 .slice([
-                    expert_idx..expert_idx + 1,
+                    *expert_idx..*expert_idx + 1,
                     0..self.moe_intermediate_size,
                     0..hidden,
                 ])
                 .reshape([self.moe_intermediate_size, hidden]);
 
-            // SwiGLU: split gate_up into gate and up
-            // expert_input @ expert_gate_up -> [n, 2*moe_intermediate]
+            // SwiGLU
             let gate_up = expert_input.matmul(expert_gate_up);
             let gate = gate_up.clone().slice([0..n, 0..self.moe_intermediate_size]);
             let up = gate_up.slice([
@@ -449,26 +540,24 @@ impl<B: Backend> MoeLayer<B> {
             ]);
             let hidden_states = activation::silu(gate) * up;
 
-            // down_proj: [n, moe_intermediate] @ [moe_intermediate, hidden] -> [n, hidden]
             let expert_output = hidden_states.matmul(expert_down);
 
-            // Weight the expert output and scatter back
+            // Weight and scatter back
+            let token_weights: Vec<f32> = assignments.iter().map(|&(_, w)| w).collect();
             let weight_tensor = Tensor::<B, 1>::from_floats(token_weights.as_slice(), &device)
                 .unsqueeze_dim::<2>(1);
             let weighted_output = expert_output * weight_tensor;
 
-            // Scatter add: for each token in this expert batch, add to output
-            let scatter_indices: Vec<i32> = token_indices.iter().map(|&i| i as i32).collect();
+            let scatter_indices: Vec<i32> = assignments.iter().map(|&(ti, _)| ti as i32).collect();
             let scatter_tensor = Tensor::<B, 1, Int>::from_data(
                 burn::tensor::TensorData::new(scatter_indices, [n]),
                 &device,
             );
-            // Expand scatter indices to [n, hidden] for scatter_along_dim
             let scatter_2d = scatter_tensor.unsqueeze_dim::<2>(1).expand([n, hidden]);
             output = output.scatter(0, scatter_2d, weighted_output, IndexingUpdateOp::Add);
         }
 
-        output.reshape([batch, seq_len, hidden])
+        output
     }
 }
 
@@ -1068,6 +1157,24 @@ mod tests {
         assert_eq!(out.dims(), [1, 2, 4]);
         // Output should be deterministic (not all zeros, since weights are zero-initialized
         // the actual output will be zeros here, but shape is correct)
+    }
+
+    #[test]
+    fn moe_layer_decode_single_token() {
+        // Single token triggers the batched path (num_tokens=1 <= num_experts_per_tok=2)
+        let dev = device();
+        let mut moe = MoeLayer::new(4, 4, 2, 8, true, &dev);
+        // Set non-zero weights so output is non-trivial
+        moe.router_weight = Param::from_tensor(Tensor::from_floats([[1., 0., 0., 0.]; 4], &dev));
+        moe.gate_up_proj = Param::from_tensor(Tensor::<B, 3>::ones([4, 4, 16], &dev) * 0.1);
+        moe.down_proj = Param::from_tensor(Tensor::<B, 3>::ones([4, 8, 4], &dev) * 0.1);
+        let x = Tensor::<B, 3>::ones([1, 1, 4], &dev);
+        let out = moe.forward(x);
+        assert_eq!(out.dims(), [1, 1, 4]);
+        // Output should be non-zero with non-zero weights
+        let vals = to_vec(out);
+        let sum: f32 = vals.iter().map(|v| v.abs()).sum();
+        assert!(sum > 1e-6, "expected non-zero output from batched path");
     }
 
     #[test]

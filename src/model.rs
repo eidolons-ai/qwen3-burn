@@ -600,7 +600,193 @@ fn sample_token<B: Backend>(logits: &Tensor<B, 2>, temperature: f64, sampler: &m
     val as u32
 }
 
+type TensorMap = HashMap<String, (Vec<f32>, Vec<usize>)>;
+
+/// Remove a 1D tensor from the map, consuming the f32 data (no clone).
+fn take_tensor_1d<B: Backend>(
+    map: &mut TensorMap,
+    name: &str,
+    device: &Device<B>,
+) -> Result<Tensor<B, 1>, Box<dyn std::error::Error>> {
+    let (data, _shape) = map
+        .remove(name)
+        .ok_or_else(|| format!("Tensor '{}' not found in safetensors", name))?;
+    let len = data.len();
+    Ok(Tensor::from_data(TensorData::new(data, [len]), device))
+}
+
+/// Remove a 2D tensor from the map (no transpose), consuming the f32 data.
+fn take_tensor_2d<B: Backend>(
+    map: &mut TensorMap,
+    name: &str,
+    device: &Device<B>,
+) -> Result<Tensor<B, 2>, Box<dyn std::error::Error>> {
+    let (data, shape) = map
+        .remove(name)
+        .ok_or_else(|| format!("Tensor '{}' not found in safetensors", name))?;
+    assert_eq!(
+        shape.len(),
+        2,
+        "Expected 2D tensor for {}, got {:?}",
+        name,
+        shape
+    );
+    Ok(Tensor::from_data(
+        TensorData::new(data, [shape[0], shape[1]]),
+        device,
+    ))
+}
+
+/// Remove a 2D Linear weight and transpose from PyTorch [out, in] to Burn [in, out].
+fn take_linear_weight<B: Backend>(
+    map: &mut TensorMap,
+    name: &str,
+    device: &Device<B>,
+) -> Result<Tensor<B, 2>, Box<dyn std::error::Error>> {
+    Ok(take_tensor_2d(map, name, device)?.transpose())
+}
+
+/// Check whether all tensors for a given layer are present in the map.
+fn layer_tensors_ready(layer_idx: usize, config: &Qwen3Config, map: &TensorMap) -> bool {
+    let p = format!("model.layers.{}", layer_idx);
+    let has = |suffix: &str| map.contains_key(&format!("{}.{}", p, suffix));
+
+    // Attention + layernorm (common to all layers)
+    let common_ready = has("self_attn.q_proj.weight")
+        && has("self_attn.k_proj.weight")
+        && has("self_attn.v_proj.weight")
+        && has("self_attn.o_proj.weight")
+        && has("self_attn.q_norm.weight")
+        && has("self_attn.k_norm.weight")
+        && has("input_layernorm.weight")
+        && has("post_attention_layernorm.weight");
+    if !common_ready {
+        return false;
+    }
+
+    if config.is_moe_layer(layer_idx) {
+        if !has("mlp.gate.weight") {
+            return false;
+        }
+        let ne = config.num_experts.unwrap();
+        for j in 0..ne {
+            for proj in &["gate_proj", "up_proj", "down_proj"] {
+                if !map.contains_key(&format!("{}.mlp.experts.{}.{}.weight", p, j, proj)) {
+                    return false;
+                }
+            }
+        }
+    } else if !has("mlp.gate_proj.weight")
+        || !has("mlp.up_proj.weight")
+        || !has("mlp.down_proj.weight")
+    {
+        return false;
+    }
+
+    true
+}
+
+/// Load a single layer's weights from the map into the transformer, consuming (removing)
+/// the f32 data from the map to free memory immediately.
+fn load_layer_weights<B: Backend>(
+    map: &mut TensorMap,
+    transformer: Transformer<B>,
+    layer_idx: usize,
+    config: &Qwen3Config,
+    device: &Device<B>,
+) -> Result<Transformer<B>, Box<dyn std::error::Error>> {
+    let prefix = format!("model.layers.{}", layer_idx);
+
+    let q_proj_w = take_linear_weight(map, &format!("{}.self_attn.q_proj.weight", prefix), device)?;
+    let k_proj_w = take_linear_weight(map, &format!("{}.self_attn.k_proj.weight", prefix), device)?;
+    let v_proj_w = take_linear_weight(map, &format!("{}.self_attn.v_proj.weight", prefix), device)?;
+    let o_proj_w = take_linear_weight(map, &format!("{}.self_attn.o_proj.weight", prefix), device)?;
+    let q_norm_w = take_tensor_1d(map, &format!("{}.self_attn.q_norm.weight", prefix), device)?;
+    let k_norm_w = take_tensor_1d(map, &format!("{}.self_attn.k_norm.weight", prefix), device)?;
+    let input_ln_w = take_tensor_1d(map, &format!("{}.input_layernorm.weight", prefix), device)?;
+    let post_attn_ln_w = take_tensor_1d(
+        map,
+        &format!("{}.post_attention_layernorm.weight", prefix),
+        device,
+    )?;
+
+    if config.is_moe_layer(layer_idx) {
+        let num_experts = config.num_experts.unwrap();
+
+        // Build gate_up_proj: [num_experts, hidden, 2*moe_intermediate]
+        let mut gate_up_experts: Vec<Tensor<B, 3>> = Vec::with_capacity(num_experts);
+        for j in 0..num_experts {
+            let gate = take_linear_weight(
+                map,
+                &format!("{}.mlp.experts.{}.gate_proj.weight", prefix, j),
+                device,
+            )?;
+            let up = take_linear_weight(
+                map,
+                &format!("{}.mlp.experts.{}.up_proj.weight", prefix, j),
+                device,
+            )?;
+            gate_up_experts.push(Tensor::cat(vec![gate, up], 1).unsqueeze_dim(0));
+        }
+        let gate_up_proj = Tensor::cat(gate_up_experts, 0);
+
+        // Build down_proj: [num_experts, moe_intermediate, hidden]
+        let mut down_experts: Vec<Tensor<B, 3>> = Vec::with_capacity(num_experts);
+        for j in 0..num_experts {
+            let down = take_linear_weight(
+                map,
+                &format!("{}.mlp.experts.{}.down_proj.weight", prefix, j),
+                device,
+            )?;
+            down_experts.push(down.unsqueeze_dim(0));
+        }
+        let down_proj = Tensor::cat(down_experts, 0);
+
+        let router_weight = take_tensor_2d(map, &format!("{}.mlp.gate.weight", prefix), device)?;
+
+        Ok(transformer.load_moe_layer(
+            layer_idx,
+            q_proj_w,
+            k_proj_w,
+            v_proj_w,
+            o_proj_w,
+            q_norm_w,
+            k_norm_w,
+            gate_up_proj,
+            down_proj,
+            router_weight,
+            input_ln_w,
+            post_attn_ln_w,
+        ))
+    } else {
+        let gate_proj_w =
+            take_linear_weight(map, &format!("{}.mlp.gate_proj.weight", prefix), device)?;
+        let up_proj_w = take_linear_weight(map, &format!("{}.mlp.up_proj.weight", prefix), device)?;
+        let down_proj_w =
+            take_linear_weight(map, &format!("{}.mlp.down_proj.weight", prefix), device)?;
+
+        Ok(transformer.load_layer(
+            layer_idx,
+            q_proj_w,
+            k_proj_w,
+            v_proj_w,
+            o_proj_w,
+            q_norm_w,
+            k_norm_w,
+            gate_proj_w,
+            up_proj_w,
+            down_proj_w,
+            input_ln_w,
+            post_attn_ln_w,
+        ))
+    }
+}
+
 /// Load safetensors weights into the transformer model.
+///
+/// Streams weights shard-by-shard: after reading each shard file, completed layers are
+/// loaded into the model immediately and their f32 data is freed. This keeps peak memory
+/// close to the final model size rather than 2-3x that.
 fn load_safetensors_weights<B: Backend>(
     mut transformer: Transformer<B>,
     model_dir: &Path,
@@ -623,193 +809,96 @@ fn load_safetensors_weights<B: Backend>(
 
     st_files.sort();
 
-    // Load all tensors from all files
-
-    // We need to keep the file data alive while we use tensor views
-    let mut file_data: Vec<Vec<u8>> = Vec::new();
-    for path in &st_files {
-        let data = std::fs::read(path)?;
-        file_data.push(data);
-    }
-
-    // Load all tensor data as owned f32 vectors.
-    let mut tensor_map: HashMap<String, (Vec<f32>, Vec<usize>)> = HashMap::new();
-
-    for file_bytes in &file_data {
-        let tensors = safetensors::SafeTensors::deserialize(file_bytes)?;
-        for (name, tensor_view) in tensors.tensors() {
-            let shape: Vec<usize> = tensor_view.shape().to_vec();
-            let dtype = tensor_view.dtype();
-            let data = tensor_view.data();
-
-            let float_data: Vec<f32> = match dtype {
-                safetensors::Dtype::F32 => data
-                    .chunks_exact(4)
-                    .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-                    .collect(),
-                safetensors::Dtype::F16 => data
-                    .chunks_exact(2)
-                    .map(|chunk| half::f16::from_le_bytes([chunk[0], chunk[1]]).to_f32())
-                    .collect(),
-                safetensors::Dtype::BF16 => data
-                    .chunks_exact(2)
-                    .map(|chunk| half::bf16::from_le_bytes([chunk[0], chunk[1]]).to_f32())
-                    .collect(),
-                _ => {
-                    return Err(format!("Unsupported dtype {:?} for tensor {}", dtype, name).into())
+    let num_layers = config.num_hidden_layers;
+    let tensor_needed = |name: &str| -> bool {
+        if let Some(rest) = name.strip_prefix("model.layers.") {
+            if let Some(dot_pos) = rest.find('.') {
+                if let Ok(layer_idx) = rest[..dot_pos].parse::<usize>() {
+                    return layer_idx < num_layers;
                 }
-            };
+            }
+        }
+        true // non-layer tensors (embed_tokens, model.norm, lm_head) are always needed
+    };
 
-            tensor_map.insert(name.to_string(), (float_data, shape));
+    let mut tensor_map: TensorMap = HashMap::new();
+    let mut next_layer: usize = 0;
+    let mut embed_loaded = false;
+    let mut lm_head_weight: Option<Tensor<B, 2>> = None;
+
+    for (shard_idx, path) in st_files.iter().enumerate() {
+        eprintln!("Reading shard {}/{}...", shard_idx + 1, st_files.len());
+
+        // Read shard and extract needed tensors into tensor_map.
+        // The shard bytes are freed at the end of this block.
+        {
+            let file_bytes = std::fs::read(path)?;
+            let tensors = safetensors::SafeTensors::deserialize(&file_bytes)?;
+            for (name, tensor_view) in tensors.tensors() {
+                if !tensor_needed(&name) {
+                    continue;
+                }
+                let shape: Vec<usize> = tensor_view.shape().to_vec();
+                let dtype = tensor_view.dtype();
+                let data = tensor_view.data();
+
+                let float_data: Vec<f32> = match dtype {
+                    safetensors::Dtype::F32 => data
+                        .chunks_exact(4)
+                        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                        .collect(),
+                    safetensors::Dtype::F16 => data
+                        .chunks_exact(2)
+                        .map(|chunk| half::f16::from_le_bytes([chunk[0], chunk[1]]).to_f32())
+                        .collect(),
+                    safetensors::Dtype::BF16 => data
+                        .chunks_exact(2)
+                        .map(|chunk| half::bf16::from_le_bytes([chunk[0], chunk[1]]).to_f32())
+                        .collect(),
+                    _ => {
+                        return Err(
+                            format!("Unsupported dtype {:?} for tensor {}", dtype, name).into()
+                        )
+                    }
+                };
+
+                tensor_map.insert(name.to_string(), (float_data, shape));
+            }
+        }
+
+        // Load embedding as soon as it's available.
+        if !embed_loaded && tensor_map.contains_key("model.embed_tokens.weight") {
+            eprintln!("Loading embedding weights...");
+            let embed_weight =
+                take_tensor_2d(&mut tensor_map, "model.embed_tokens.weight", device)?;
+            if config.tie_word_embeddings {
+                lm_head_weight = Some(embed_weight.clone().transpose());
+            }
+            transformer = transformer.load_embed_tokens(embed_weight);
+            embed_loaded = true;
+        }
+
+        // Load any layers whose tensors are now all available.
+        while next_layer < num_layers && layer_tensors_ready(next_layer, config, &tensor_map) {
+            if next_layer.is_multiple_of(10) {
+                eprintln!("Loading layer {}/{}...", next_layer, num_layers);
+            }
+            transformer =
+                load_layer_weights(&mut tensor_map, transformer, next_layer, config, device)?;
+            next_layer += 1;
         }
     }
 
-    // Helper to get a 1D tensor from the map
-    let get_tensor_1d = |name: &str| -> Result<Tensor<B, 1>, Box<dyn std::error::Error>> {
-        let (data, _shape) = tensor_map
-            .get(name)
-            .ok_or_else(|| format!("Tensor '{}' not found in safetensors", name))?;
-        let td = TensorData::new(data.clone(), [data.len()]);
-        Ok(Tensor::from_data(td, device))
-    };
-
-    // Helper to get a raw 2D tensor from the map (no transpose).
-    let get_tensor_2d_raw = |name: &str| -> Result<Tensor<B, 2>, Box<dyn std::error::Error>> {
-        let (data, shape) = tensor_map
-            .get(name)
-            .ok_or_else(|| format!("Tensor '{}' not found in safetensors", name))?;
-        assert_eq!(
-            shape.len(),
-            2,
-            "Expected 2D tensor for {}, got {:?}",
-            name,
-            shape
-        );
-        let td = TensorData::new(data.clone(), [shape[0], shape[1]]);
-        Ok(Tensor::from_data(td, device))
-    };
-
-    // Helper to get a 2D Linear weight tensor.
-    // PyTorch stores Linear weights as [out, in], but Burn uses [in, out],
-    // so we transpose when loading.
-    let get_linear_weight = |name: &str| -> Result<Tensor<B, 2>, Box<dyn std::error::Error>> {
-        Ok(get_tensor_2d_raw(name)?.transpose())
-    };
-
-    // Helper to get a raw 3D tensor (for packed expert weights).
-    let get_tensor_3d_raw = |name: &str| -> Result<Tensor<B, 3>, Box<dyn std::error::Error>> {
-        let (data, shape) = tensor_map
-            .get(name)
-            .ok_or_else(|| format!("Tensor '{}' not found in safetensors", name))?;
-        assert_eq!(
-            shape.len(),
-            3,
-            "Expected 3D tensor for {}, got {:?}",
-            name,
-            shape
-        );
-        let td = TensorData::new(data.clone(), [shape[0], shape[1], shape[2]]);
-        Ok(Tensor::from_data(td, device))
-    };
-
-    // Helper to get a 3D expert weight tensor and transpose the per-expert matrices.
-    // PyTorch stores as [num_experts, out, in], Burn needs [num_experts, in, out].
-    let get_expert_weight = |name: &str| -> Result<Tensor<B, 3>, Box<dyn std::error::Error>> {
-        let raw = get_tensor_3d_raw(name)?;
-        // Swap dims 1 and 2 to transpose each expert's weight matrix
-        Ok(raw.swap_dims(1, 2))
-    };
-
-    // Load embedding weights (no transpose needed for embeddings)
-    eprintln!("Loading embedding weights...");
-    let embed_weight = get_tensor_2d_raw("model.embed_tokens.weight")?;
-    transformer = transformer.load_embed_tokens(embed_weight);
-
-    // Load layer weights
-    for i in 0..config.num_hidden_layers {
-        if i % 10 == 0 {
-            eprintln!("Loading layer {}/{}...", i, config.num_hidden_layers);
-        }
-
-        let prefix = format!("model.layers.{}", i);
-
-        // Attention projections (transpose for Burn's Linear convention)
-        let q_proj_w = get_linear_weight(&format!("{}.self_attn.q_proj.weight", prefix))?;
-        let k_proj_w = get_linear_weight(&format!("{}.self_attn.k_proj.weight", prefix))?;
-        let v_proj_w = get_linear_weight(&format!("{}.self_attn.v_proj.weight", prefix))?;
-        let o_proj_w = get_linear_weight(&format!("{}.self_attn.o_proj.weight", prefix))?;
-
-        // QK-Norm weights
-        let q_norm_w = get_tensor_1d(&format!("{}.self_attn.q_norm.weight", prefix))?;
-        let k_norm_w = get_tensor_1d(&format!("{}.self_attn.k_norm.weight", prefix))?;
-
-        // Layer norm weights
-        let input_ln_w = get_tensor_1d(&format!("{}.input_layernorm.weight", prefix))?;
-        let post_attn_ln_w = get_tensor_1d(&format!("{}.post_attention_layernorm.weight", prefix))?;
-
-        if config.is_moe_layer(i) {
-            // MoE layer: load packed expert weights + router
-            // gate_up_proj: [num_experts, 2*moe_intermediate, hidden] -> transposed to [num_experts, hidden, 2*moe_intermediate]
-            let gate_up_proj = get_expert_weight(&format!("{}.mlp.experts.gate_up_proj", prefix))?;
-            // down_proj: [num_experts, hidden, moe_intermediate] -> transposed to [num_experts, moe_intermediate, hidden]
-            let down_proj = get_expert_weight(&format!("{}.mlp.experts.down_proj", prefix))?;
-            // router.weight: [num_experts, hidden] (no transpose needed, used as-is for matmul)
-            let router_weight = get_tensor_2d_raw(&format!("{}.mlp.router.weight", prefix))?;
-
-            transformer = transformer.load_moe_layer(
-                i,
-                q_proj_w,
-                k_proj_w,
-                v_proj_w,
-                o_proj_w,
-                q_norm_w,
-                k_norm_w,
-                gate_up_proj,
-                down_proj,
-                router_weight,
-                input_ln_w,
-                post_attn_ln_w,
-            );
-        } else {
-            // Dense layer: load individual MLP weights
-            let gate_proj_w = get_linear_weight(&format!("{}.mlp.gate_proj.weight", prefix))?;
-            let up_proj_w = get_linear_weight(&format!("{}.mlp.up_proj.weight", prefix))?;
-            let down_proj_w = get_linear_weight(&format!("{}.mlp.down_proj.weight", prefix))?;
-
-            transformer = transformer.load_layer(
-                i,
-                q_proj_w,
-                k_proj_w,
-                v_proj_w,
-                o_proj_w,
-                q_norm_w,
-                k_norm_w,
-                gate_proj_w,
-                up_proj_w,
-                down_proj_w,
-                input_ln_w,
-                post_attn_ln_w,
-            );
-        }
-    }
-
-    // Load final norm
+    // Load final norm and lm_head (from whatever remains in the map).
     eprintln!("Loading final norm and lm_head...");
-    let norm_weight = get_tensor_1d("model.norm.weight")?;
+    let norm_weight = take_tensor_1d(&mut tensor_map, "model.norm.weight", device)?;
     transformer = transformer.load_norm(norm_weight);
 
-    // Load lm_head (may be tied with embeddings)
-    // For lm_head, the weight maps input [d_model] -> [vocab_size],
-    // so it's a Linear layer needing transpose.
-    // When tied with embeddings, we use the embedding weight which is [vocab_size, d_model],
-    // which happens to already be the correct transposed form for Burn's Linear [in, out] = [d_model, vocab_size].
-    if config.tie_word_embeddings {
-        let embed_weight = get_tensor_2d_raw("model.embed_tokens.weight")?;
-        // Embedding is [vocab_size, d_model], need [d_model, vocab_size] for Linear
-        transformer = transformer.load_lm_head(embed_weight.transpose());
+    if let Some(w) = lm_head_weight {
+        transformer = transformer.load_lm_head(w);
     } else {
-        let lm_head_weight = get_linear_weight("lm_head.weight")?;
-        transformer = transformer.load_lm_head(lm_head_weight);
+        let w = take_linear_weight(&mut tensor_map, "lm_head.weight", device)?;
+        transformer = transformer.load_lm_head(w);
     }
 
     eprintln!("Model loaded successfully.");
