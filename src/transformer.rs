@@ -67,10 +67,10 @@ impl<B: Backend> RotaryEmbedding<B> {
             sin_data.extend_from_within(start..);
         }
 
-        let cos = Tensor::<B, 1>::from_floats(&cos_data[..], device)
-            .reshape([max_seq_len, head_dim]);
-        let sin = Tensor::<B, 1>::from_floats(&sin_data[..], device)
-            .reshape([max_seq_len, head_dim]);
+        let cos =
+            Tensor::<B, 1>::from_floats(&cos_data[..], device).reshape([max_seq_len, head_dim]);
+        let sin =
+            Tensor::<B, 1>::from_floats(&sin_data[..], device).reshape([max_seq_len, head_dim]);
 
         Self { cos, sin }
     }

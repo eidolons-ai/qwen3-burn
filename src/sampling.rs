@@ -32,12 +32,14 @@ impl Sampler {
     pub fn sample_probs(&mut self, probs: &[f64]) -> u32 {
         match self {
             Self::TopP(s) => s.sample_probs(probs),
-            Self::Argmax => probs
-                .iter()
-                .enumerate()
-                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-                .unwrap()
-                .0 as u32,
+            Self::Argmax => {
+                probs
+                    .iter()
+                    .enumerate()
+                    .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                    .unwrap()
+                    .0 as u32
+            }
         }
     }
 }
@@ -99,9 +101,7 @@ impl TopP {
             }
         }
 
-        let next_token_idx = WeightedIndex::new(weights)
-            .unwrap()
-            .sample(&mut self.rng);
+        let next_token_idx = WeightedIndex::new(weights).unwrap().sample(&mut self.rng);
 
         indexed[next_token_idx].0 as u32
     }
