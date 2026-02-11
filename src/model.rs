@@ -381,7 +381,7 @@ impl<B: Backend> Qwen3<B> {
     /// Load a Qwen3 model from a GGUF file.
     ///
     /// Only requires a single `.gguf` file; config is extracted from GGUF metadata.
-    /// Supported GGUF quantization types: F32, F16, BF16, Q8_0, Q4_0.
+    /// Supported GGUF quantization types: F32, F16, BF16, Q8_0, Q4_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K.
     pub fn from_gguf(
         gguf_path: impl AsRef<Path>,
         max_seq_len: usize,
@@ -1160,6 +1160,11 @@ fn detect_gguf_quantization(gguf_file: &gguf::GgufFile) -> QuantizationMode {
     match dtype {
         Some(gguf::GgufDtype::Q8_0) => QuantizationMode::Int8,
         Some(gguf::GgufDtype::Q4_0) => QuantizationMode::Int4,
+        // K-quant types: higher precision sources map to Int8, lower to Int4
+        Some(gguf::GgufDtype::Q5_K) | Some(gguf::GgufDtype::Q6_K) => QuantizationMode::Int8,
+        Some(gguf::GgufDtype::Q2_K) | Some(gguf::GgufDtype::Q3_K) | Some(gguf::GgufDtype::Q4_K) => {
+            QuantizationMode::Int4
+        }
         _ => QuantizationMode::None,
     }
 }
@@ -1822,6 +1827,121 @@ mod tests {
                 name: "blk.0.attn_q.weight".to_string(),
                 dims: vec![1024, 1024],
                 dtype: crate::gguf::GgufDtype::Q4_0,
+                offset: 0,
+                num_elements: 1024 * 1024,
+                data_size: 0,
+            },
+        );
+        let gguf = crate::gguf::GgufFile {
+            metadata: HashMap::new(),
+            tensors,
+            tensor_data_offset: 0,
+        };
+        assert_eq!(detect_gguf_quantization(&gguf), QuantizationMode::Int4);
+    }
+
+    #[test]
+    fn detect_gguf_quantization_q4_k() {
+        use std::collections::HashMap;
+        let mut tensors = HashMap::new();
+        tensors.insert(
+            "blk.0.attn_q.weight".to_string(),
+            crate::gguf::GgufTensorInfo {
+                name: "blk.0.attn_q.weight".to_string(),
+                dims: vec![1024, 1024],
+                dtype: crate::gguf::GgufDtype::Q4_K,
+                offset: 0,
+                num_elements: 1024 * 1024,
+                data_size: 0,
+            },
+        );
+        let gguf = crate::gguf::GgufFile {
+            metadata: HashMap::new(),
+            tensors,
+            tensor_data_offset: 0,
+        };
+        assert_eq!(detect_gguf_quantization(&gguf), QuantizationMode::Int4);
+    }
+
+    #[test]
+    fn detect_gguf_quantization_q6_k() {
+        use std::collections::HashMap;
+        let mut tensors = HashMap::new();
+        tensors.insert(
+            "blk.0.attn_q.weight".to_string(),
+            crate::gguf::GgufTensorInfo {
+                name: "blk.0.attn_q.weight".to_string(),
+                dims: vec![1024, 1024],
+                dtype: crate::gguf::GgufDtype::Q6_K,
+                offset: 0,
+                num_elements: 1024 * 1024,
+                data_size: 0,
+            },
+        );
+        let gguf = crate::gguf::GgufFile {
+            metadata: HashMap::new(),
+            tensors,
+            tensor_data_offset: 0,
+        };
+        assert_eq!(detect_gguf_quantization(&gguf), QuantizationMode::Int8);
+    }
+
+    #[test]
+    fn detect_gguf_quantization_q5_k() {
+        use std::collections::HashMap;
+        let mut tensors = HashMap::new();
+        tensors.insert(
+            "blk.0.attn_q.weight".to_string(),
+            crate::gguf::GgufTensorInfo {
+                name: "blk.0.attn_q.weight".to_string(),
+                dims: vec![1024, 1024],
+                dtype: crate::gguf::GgufDtype::Q5_K,
+                offset: 0,
+                num_elements: 1024 * 1024,
+                data_size: 0,
+            },
+        );
+        let gguf = crate::gguf::GgufFile {
+            metadata: HashMap::new(),
+            tensors,
+            tensor_data_offset: 0,
+        };
+        assert_eq!(detect_gguf_quantization(&gguf), QuantizationMode::Int8);
+    }
+
+    #[test]
+    fn detect_gguf_quantization_q2_k() {
+        use std::collections::HashMap;
+        let mut tensors = HashMap::new();
+        tensors.insert(
+            "blk.0.attn_q.weight".to_string(),
+            crate::gguf::GgufTensorInfo {
+                name: "blk.0.attn_q.weight".to_string(),
+                dims: vec![1024, 1024],
+                dtype: crate::gguf::GgufDtype::Q2_K,
+                offset: 0,
+                num_elements: 1024 * 1024,
+                data_size: 0,
+            },
+        );
+        let gguf = crate::gguf::GgufFile {
+            metadata: HashMap::new(),
+            tensors,
+            tensor_data_offset: 0,
+        };
+        assert_eq!(detect_gguf_quantization(&gguf), QuantizationMode::Int4);
+    }
+
+    #[test]
+    fn detect_gguf_quantization_q3_k() {
+        use std::collections::HashMap;
+        let mut tensors = HashMap::new();
+        tensors.insert(
+            "blk.0.attn_q.weight".to_string(),
+            crate::gguf::GgufTensorInfo {
+                name: "blk.0.attn_q.weight".to_string(),
+                dims: vec![1024, 1024],
+                dtype: crate::gguf::GgufDtype::Q3_K,
                 offset: 0,
                 num_elements: 1024 * 1024,
                 data_size: 0,
