@@ -24,6 +24,22 @@ impl Sampler {
             Self::Argmax => logits.argmax(1),
         }
     }
+
+    /// Sample from a pre-computed f64 probability distribution on CPU.
+    ///
+    /// This avoids running softmax on the GPU where f16 precision can cause
+    /// overflow/underflow over large vocabularies.
+    pub fn sample_probs(&mut self, probs: &[f64]) -> u32 {
+        match self {
+            Self::TopP(s) => s.sample_probs(probs),
+            Self::Argmax => probs
+                .iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                .unwrap()
+                .0 as u32,
+        }
+    }
 }
 
 /// Top-p (nucleus) sampling selects from the smallest set of tokens whose
@@ -65,6 +81,29 @@ impl TopP {
             .sample(&mut self.rng);
 
         probs_idx.slice([0..1, next_token_idx..next_token_idx + 1])
+    }
+
+    /// Sample from f64 probabilities on CPU — avoids f16 softmax precision issues.
+    pub fn sample_probs(&mut self, probs: &[f64]) -> u32 {
+        let mut indexed: Vec<(usize, f64)> = probs.iter().copied().enumerate().collect();
+        indexed.sort_by(|(_, a), (_, b)| b.partial_cmp(a).unwrap());
+
+        let mut weights: Vec<f64> = Vec::with_capacity(indexed.len());
+        let mut cumsum = 0.0;
+        for &(_, p) in &indexed {
+            if cumsum >= self.p {
+                weights.push(0.0);
+            } else {
+                cumsum += p;
+                weights.push(p);
+            }
+        }
+
+        let next_token_idx = WeightedIndex::new(weights)
+            .unwrap()
+            .sample(&mut self.rng);
+
+        indexed[next_token_idx].0 as u32
     }
 }
 

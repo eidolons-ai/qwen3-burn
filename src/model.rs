@@ -4,7 +4,6 @@ use std::path::Path;
 use std::time::Instant;
 
 use burn::prelude::*;
-use burn::tensor::activation;
 use burn::tensor::TensorData;
 use serde::Deserialize;
 
@@ -580,25 +579,31 @@ impl<B: Backend> Qwen3<B> {
 }
 
 /// Apply temperature scaling and sample a token.
+///
+/// Logits are extracted to f64 on CPU before softmax so that f16 backends
+/// don't overflow/underflow over large vocabularies.
 fn sample_token<B: Backend>(logits: &Tensor<B, 2>, temperature: f64, sampler: &mut Sampler) -> u32 {
+    let logits_f64: Vec<f64> = logits.to_data().iter::<f64>().collect();
+
     if temperature <= 0.0 {
-        // Greedy: always pick the highest-logit token regardless of sampler
-        return logits
-            .clone()
-            .argmax(1)
-            .to_data()
-            .iter::<i64>()
-            .next()
-            .unwrap() as u32;
+        return logits_f64
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+            .unwrap()
+            .0 as u32;
     }
 
-    let scaled = logits.clone() / temperature;
-    let probs = activation::softmax(scaled, 1);
+    // Temperature scaling + softmax in f64
+    let max = logits_f64.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let exp: Vec<f64> = logits_f64
+        .iter()
+        .map(|&x| ((x - max) / temperature).exp())
+        .collect();
+    let sum: f64 = exp.iter().sum();
+    let probs: Vec<f64> = exp.iter().map(|&x| x / sum).collect();
 
-    let token_id = sampler.sample(probs);
-    let token_data = token_id.to_data();
-    let val = token_data.iter::<i64>().next().unwrap();
-    val as u32
+    sampler.sample_probs(&probs)
 }
 
 type TensorMap = HashMap<String, (Vec<f32>, Vec<usize>)>;

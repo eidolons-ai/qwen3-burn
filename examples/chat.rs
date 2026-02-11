@@ -96,11 +96,13 @@ fn run<B: burn::prelude::Backend>(args: Args, device: burn::prelude::Device<B>) 
                     }
                 }
                 GenerationEvent::Token { ref text, .. } => {
-                    // Print only the newly added characters
-                    let new_text = &text[prev_text_len..];
-                    print!("{}", new_text);
-                    io::stdout().flush().unwrap();
-                    prev_text_len = text.len();
+                    // Print only the newly added characters (char-boundary safe)
+                    if prev_text_len <= text.len() {
+                        let start = text.floor_char_boundary(prev_text_len);
+                        print!("{}", &text[start..]);
+                        io::stdout().flush().unwrap();
+                        prev_text_len = text.len();
+                    }
                 }
                 GenerationEvent::Done {
                     tokens_generated,
@@ -151,8 +153,9 @@ fn main() {
     {
         use burn::backend::wgpu::WgpuDevice;
         use burn::backend::Wgpu;
+        use burn::tensor::f16;
         let device = WgpuDevice::default();
-        run::<Wgpu>(args, device);
+        run::<Wgpu<f16, i32>>(args, device);
     }
 
     #[cfg(feature = "ndarray")]

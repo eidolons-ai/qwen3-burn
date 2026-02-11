@@ -58,13 +58,16 @@ cargo run --release --features cuda --example chat -- \
 ```rust
 use burn::backend::Wgpu;
 use burn::backend::wgpu::WgpuDevice;
+use burn::tensor::f16;
 use qwen3_burn::model::Qwen3;
 use qwen3_burn::sampling::Sampler;
 use qwen3_burn::tokenizer::Qwen3Tokenizer;
 
+type Backend = Wgpu<f16, i32>;  // f16 for 2x memory savings + faster Metal/Vulkan
+
 let device = WgpuDevice::default();
 let tokenizer = Qwen3Tokenizer::new("./models/Qwen3-0.6B/tokenizer.json").unwrap();
-let mut model = Qwen3::<Wgpu>::from_pretrained("./models/Qwen3-0.6B", 2048, &device).unwrap();
+let mut model = Qwen3::<Backend>::from_pretrained("./models/Qwen3-0.6B", 2048, &device).unwrap();
 let mut sampler = Sampler::new_top_p(0.9, 42);
 
 let prompt = tokenizer.apply_chat_template("You are a helpful assistant.", "What is 2+2?");
@@ -135,11 +138,11 @@ Benchmark groups: `rms_norm`, `rope`, `feed_forward`, `moe_layer`, `attention`, 
 
 ## Backends
 
-| Feature | Backend | Notes |
-|---------|---------|-------|
-| `wgpu` | Metal / Vulkan / WebGPU | Best for macOS (Metal auto-selected) |
-| `ndarray` | CPU | No GPU required, slower |
-| `cuda` | NVIDIA CUDA | Requires CUDA toolkit |
+| Feature | Backend | Precision | Notes |
+|---------|---------|-----------|-------|
+| `wgpu` | Metal / Vulkan / WebGPU | f16 | Best for macOS (Metal auto-selected) |
+| `ndarray` | CPU | f32 | No GPU required, slower |
+| `cuda` | NVIDIA CUDA | f16 | Requires CUDA toolkit |
 
 ## License
 

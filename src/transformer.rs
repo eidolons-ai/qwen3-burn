@@ -25,8 +25,12 @@ impl<B: Backend> RmsNorm<B> {
     }
 
     pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
-        let variance = x.clone().powf_scalar(2.0).mean_dim(2);
-        let normed = x * (variance + self.eps).sqrt().recip();
+        // Pre-scale to prevent x² overflow in f16 (values > 255 overflow).
+        // The scale factor cancels: (x/s) / rms(x/s) = x / rms(x).
+        let s = x.clone().abs().max_dim(2).clamp_min(1.0);
+        let x_scaled = x / s;
+        let variance = x_scaled.clone().powf_scalar(2.0).mean_dim(2);
+        let normed = x_scaled * (variance + self.eps).sqrt().recip();
         normed * self.weight.val().unsqueeze::<3>()
     }
 }
@@ -42,27 +46,31 @@ impl<B: Backend> RotaryEmbedding<B> {
     pub fn new(head_dim: usize, max_seq_len: usize, theta: f64, device: &Device<B>) -> Self {
         let half_dim = head_dim / 2;
 
-        // Compute inverse frequencies: theta^(-2i/d) for i in 0..half_dim
-        let inv_freq: Vec<f32> = (0..half_dim)
-            .map(|i| 1.0 / (theta.powf(i as f64 * 2.0 / head_dim as f64)) as f32)
-            .collect();
-        let inv_freq = Tensor::<B, 1>::from_floats(inv_freq.as_slice(), device);
+        // Compute full angle table on CPU in f64 so that small frequencies
+        // (theta=1e6 yields values down to ~1e-6, below f16 normal range)
+        // are not flushed to zero before cos/sin.  The final cos/sin values
+        // are in [-1, 1] and convert to f16 without loss.
+        let len = max_seq_len * head_dim;
+        let mut cos_data = Vec::with_capacity(len);
+        let mut sin_data = Vec::with_capacity(len);
 
-        // Position indices
-        let positions: Vec<f32> = (0..max_seq_len).map(|p| p as f32).collect();
-        let positions = Tensor::<B, 1>::from_floats(positions.as_slice(), device);
+        for pos in 0..max_seq_len {
+            for i in 0..half_dim {
+                let freq = 1.0 / theta.powf(i as f64 * 2.0 / head_dim as f64);
+                let angle = pos as f64 * freq;
+                cos_data.push(angle.cos() as f32);
+                sin_data.push(angle.sin() as f32);
+            }
+            // Duplicate to full head_dim
+            let start = cos_data.len() - half_dim;
+            cos_data.extend_from_within(start..);
+            sin_data.extend_from_within(start..);
+        }
 
-        // Outer product: [max_seq_len] x [half_dim] -> [max_seq_len, half_dim]
-        let freqs = positions
-            .unsqueeze::<2>()
-            .transpose()
-            .matmul(inv_freq.unsqueeze::<2>());
-
-        // Duplicate to full head_dim: [max_seq_len, head_dim]
-        let freqs = Tensor::cat(vec![freqs.clone(), freqs], 1);
-
-        let cos = freqs.clone().cos();
-        let sin = freqs.sin();
+        let cos = Tensor::<B, 1>::from_floats(&cos_data[..], device)
+            .reshape([max_seq_len, head_dim]);
+        let sin = Tensor::<B, 1>::from_floats(&sin_data[..], device)
+            .reshape([max_seq_len, head_dim]);
 
         Self { cos, sin }
     }
