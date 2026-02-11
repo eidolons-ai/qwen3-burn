@@ -22,7 +22,10 @@ use crate::transformer::{
 /// wrapper skips 1D tensors (RMSNorm weights) and embedding weights.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub enum QuantizationMode {
+    /// Auto-detect from GGUF source (Q8_0→Int8, Q4_0→Int4); no quantization for SafeTensors.
     #[default]
+    Auto,
+    /// No quantization — always load as f32. Works on all backends including NdArray/CPU.
     None,
     /// INT8 symmetric per-block quantization (Q8S, block size 32). Requires GPU backend.
     Int8,
@@ -351,8 +354,12 @@ impl<B: Backend> Qwen3<B> {
         // Load weights from safetensors
         let transformer = load_safetensors_weights(transformer, model_dir, &config, device)?;
 
-        // Quantize weights if requested
-        let transformer = apply_quantization(transformer, quantization);
+        // Quantize weights if requested (Auto means no quantization for SafeTensors)
+        let effective = match quantization {
+            QuantizationMode::Auto => QuantizationMode::None,
+            other => other,
+        };
+        let transformer = apply_quantization(transformer, effective);
 
         let rope = RotaryEmbedding::new(config.head_dim, max_seq_len, config.rope_theta, device);
 
@@ -435,19 +442,18 @@ impl<B: Backend> Qwen3<B> {
             device,
         );
 
-        // Resolve quantization mode: auto-detect from GGUF if user didn't specify
+        // Resolve quantization mode: auto-detect from GGUF when Auto
         let detected = detect_gguf_quantization(&gguf_file);
-        let resolved_quant = if quantization == QuantizationMode::None {
-            detected
-        } else {
-            quantization
+        let resolved_quant = match quantization {
+            QuantizationMode::Auto => detected,
+            other => other,
         };
 
         // Build QuantScheme for per-tensor quantized loading
         let quant_scheme = {
             use burn::tensor::quantization::{QuantLevel, QuantScheme, QuantValue};
             match resolved_quant {
-                QuantizationMode::None => None,
+                QuantizationMode::Auto | QuantizationMode::None => None,
                 QuantizationMode::Int8 => {
                     eprintln!("Loading GGUF with per-tensor INT8 quantization...");
                     Some(
@@ -482,7 +488,7 @@ impl<B: Backend> Qwen3<B> {
         let transformer = if per_tensor_quantized {
             transformer
         } else {
-            apply_quantization(transformer, quantization)
+            apply_quantization(transformer, resolved_quant)
         };
 
         let rope = RotaryEmbedding::new(config.head_dim, max_seq_len, config.rope_theta, device);
@@ -1421,7 +1427,7 @@ fn apply_quantization<B: Backend>(
     use burn::tensor::quantization::{Calibration, QuantLevel, QuantScheme, QuantValue};
 
     let scheme = match mode {
-        QuantizationMode::None => return transformer,
+        QuantizationMode::Auto | QuantizationMode::None => return transformer,
         QuantizationMode::Int8 => {
             eprintln!("Quantizing weights to INT8...");
             QuantScheme::default()
@@ -1639,8 +1645,8 @@ mod tests {
     }
 
     #[test]
-    fn quantization_mode_default_is_none() {
-        assert_eq!(QuantizationMode::default(), QuantizationMode::None);
+    fn quantization_mode_default_is_auto() {
+        assert_eq!(QuantizationMode::default(), QuantizationMode::Auto);
     }
 
     #[test]

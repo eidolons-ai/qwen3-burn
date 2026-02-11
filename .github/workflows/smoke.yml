@@ -1,0 +1,44 @@
+name: Smoke Test
+
+on:
+  schedule:
+    - cron: "0 6 * * 1" # Weekly on Monday at 06:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  MODEL_DIR: models/Qwen3-0.6B-GGUF
+  GGUF_FILE: Qwen3-0.6B-Q8_0.gguf
+  HF_BASE: https://huggingface.co
+
+jobs:
+  smoke:
+    name: Smoke (GGUF, CPU)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Cache model files
+        id: cache-model
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: ${{ env.MODEL_DIR }}
+          key: qwen3-0.6b-gguf-q8_0
+
+      - name: Download model files
+        if: steps.cache-model.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p "$MODEL_DIR"
+          curl -fSL "$HF_BASE/Qwen/Qwen3-0.6B-GGUF/resolve/main/$GGUF_FILE" -o "$MODEL_DIR/$GGUF_FILE"
+          curl -fSL "$HF_BASE/Qwen/Qwen3-0.6B/resolve/main/tokenizer.json" -o "$MODEL_DIR/tokenizer.json"
+
+      - uses: actions-rust-lang/setup-rust-toolchain@1780873c7b576612439a134613cc4cc74ce5538c # v1.15.2
+        with:
+          rustflags: ""
+
+      - name: Run smoke test
+        run: cargo test -- --ignored smoke_gguf_generate

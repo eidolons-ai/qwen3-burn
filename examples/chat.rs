@@ -41,8 +41,8 @@ struct Args {
     #[arg(long)]
     chunk_size: Option<usize>,
 
-    /// Weight quantization: none, int8, int4
-    #[arg(long, default_value = "none")]
+    /// Weight quantization: auto, none, int8, int4
+    #[arg(long, default_value = "auto")]
     quantize: String,
 
     /// Model format: auto, safetensors, gguf
@@ -56,12 +56,13 @@ struct Args {
 
 fn parse_quantization(s: &str) -> QuantizationMode {
     match s {
+        "auto" => QuantizationMode::Auto,
         "none" => QuantizationMode::None,
         "int8" => QuantizationMode::Int8,
         "int4" => QuantizationMode::Int4,
         other => {
-            eprintln!("Unknown quantization mode '{}', using none", other);
-            QuantizationMode::None
+            eprintln!("Unknown quantization mode '{}', using auto", other);
+            QuantizationMode::Auto
         }
     }
 }

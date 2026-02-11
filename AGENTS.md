@@ -65,7 +65,7 @@ GGUF loading (`Qwen3::from_gguf()`) uses a custom zero-dependency parser in `src
 
 Supported GGUF quantization types: F32, F16, BF16, Q8_0, Q4_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K.
 
-When the GGUF source is quantized (Q8_0, Q4_0, or any k-quant type), `from_gguf()` auto-detects the quantization and loads 2D linear weights directly into PackedU32 quantized format via per-tensor CPU quantization (dequant → transpose → requant per tensor). This avoids holding a full f32 model on GPU. K-quant types Q5_K/Q6_K map to Int8; Q2_K/Q3_K/Q4_K map to Int4. The auto-detected mode can be overridden by the user's `QuantizationMode` argument; `QuantizationMode::None` upgrades to the detected mode. 1D weights (norms), embeddings, and 3D MoE expert weights always load as f32.
+When the GGUF source is quantized (Q8_0, Q4_0, or any k-quant type), `from_gguf()` auto-detects the quantization and loads 2D linear weights directly into PackedU32 quantized format via per-tensor CPU quantization (dequant → transpose → requant per tensor). This avoids holding a full f32 model on GPU. K-quant types Q5_K/Q6_K map to Int8; Q2_K/Q3_K/Q4_K map to Int4. `QuantizationMode::Auto` (the default) uses the detected mode; `QuantizationMode::None` forces f32 loading (useful for CPU/NdArray); explicit `Int8`/`Int4` override detection. 1D weights (norms), embeddings, and 3D MoE expert weights always load as f32.
 
 The architecture prefix is read from `general.architecture` in GGUF metadata (typically `qwen3` for official Qwen3 GGUFs, or `qwen2` for older conversions). Key metadata fields (shown with `{arch}` prefix):
 - `{arch}.embedding_length` -> hidden_size
@@ -117,7 +117,12 @@ python3 -c "from huggingface_hub import snapshot_download; snapshot_download('Qw
 # Download GGUF model (needs tokenizer.json from base model)
 # huggingface-cli download Qwen/Qwen3-0.6B-GGUF Qwen3-0.6B-Q8_0.gguf --local-dir ./models/Qwen3-0.6B-GGUF
 # huggingface-cli download Qwen/Qwen3-0.6B tokenizer.json --local-dir ./models/Qwen3-0.6B-GGUF
+
+# Smoke test (requires real model weights — download GGUF + tokenizer first)
+cargo test -- --ignored smoke_gguf_generate
 ```
+
+The smoke test (`tests/smoke.rs`) loads Qwen3-0.6B Q8_0 GGUF with `QuantizationMode::None` (f32 on NdArray/CPU), generates a short sequence with argmax, and asserts deterministic output. It is `#[ignore]`d so `cargo test` skips it; run with `--ignored` when model files are present. A weekly CI workflow (`.github/workflows/smoke.yml`) downloads and caches the model automatically.
 
 Backend features are mutually exclusive: `wgpu` (Metal on macOS, f16), `ndarray` (CPU, f32), `cuda` (NVIDIA, f16). The `bench` feature is independent and only enables `bench_internals` re-exports for the benchmark harness.
 
@@ -148,7 +153,7 @@ Criterion benchmarks (`benches/ops.rs`) measure all core ops parameterized by se
 
 ### Quantization
 
-- `QuantizationMode` enum: `None` (default), `Int8`, `Int4`
+- `QuantizationMode` enum: `Auto` (default, auto-detects from GGUF), `None` (always f32), `Int8`, `Int4`
 - Uses Burn's native `Quantizer` with `QuantScheme` for real packed quantized storage (`PackedU32`)
 - `SelectiveQuantizer` wraps `burn::module::Quantizer` in a `ModuleMapper<B>` that skips sensitive parameters: 1D tensors (RMSNorm weights) and embedding weights (`embed_tokens`)
 - INT8: Q8S symmetric per-block (block size 32), `PackedU32` storage — requires GPU backend (WGPU/CUDA)
