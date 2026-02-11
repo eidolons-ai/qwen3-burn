@@ -500,9 +500,7 @@ pub(crate) fn dequantize_q6_k(data: &[u8]) -> Vec<f32> {
             let mut y = [0.0f32; 128];
             for l in 0..32 {
                 let is = l / 16;
-                let q1 = (((block[ql_off + l] & 0xF) | ((block[qh_off + l] & 3) << 4))
-                    as i32)
-                    - 32;
+                let q1 = (((block[ql_off + l] & 0xF) | ((block[qh_off + l] & 3) << 4)) as i32) - 32;
                 let q2 = (((block[ql_off + l + 32] & 0xF) | (((block[qh_off + l] >> 2) & 3) << 4))
                     as i32)
                     - 32;
