@@ -3,7 +3,7 @@ use std::ops::ControlFlow;
 use std::time::Instant;
 
 use clap::Parser;
-use qwen3_burn::model::{GenerationEvent, GenerationParams, Qwen3};
+use qwen3_burn::model::{GenerationEvent, GenerationParams, QuantizationMode, Qwen3};
 use qwen3_burn::sampling::Sampler;
 use qwen3_burn::tokenizer::Qwen3Tokenizer;
 
@@ -13,7 +13,7 @@ const SYSTEM_PROMPT: &str = "You are a helpful assistant.";
 #[derive(Parser, Debug)]
 #[command(name = "qwen3-chat", about = "Qwen3 chat example using Burn")]
 struct Args {
-    /// Path to the model directory (containing config.json, tokenizer.json, *.safetensors)
+    /// Path to the model directory or .gguf file
     #[arg(short, long)]
     model_path: String,
 
@@ -41,20 +41,67 @@ struct Args {
     #[arg(long)]
     chunk_size: Option<usize>,
 
+    /// Weight quantization: none, int8, int4
+    #[arg(long, default_value = "none")]
+    quantize: String,
+
+    /// Model format: auto, safetensors, gguf
+    #[arg(long, default_value = "auto")]
+    format: String,
+
     /// Random seed
     #[arg(long, default_value_t = 42)]
     seed: u64,
 }
 
+fn parse_quantization(s: &str) -> QuantizationMode {
+    match s {
+        "none" => QuantizationMode::None,
+        "int8" => QuantizationMode::Int8,
+        "int4" => QuantizationMode::Int4,
+        other => {
+            eprintln!("Unknown quantization mode '{}', using none", other);
+            QuantizationMode::None
+        }
+    }
+}
+
 fn run<B: burn::prelude::Backend>(args: Args, device: burn::prelude::Device<B>) {
+    let model_path = std::path::Path::new(&args.model_path);
+
+    // Determine format: auto-detect from file extension
+    let use_gguf = match args.format.as_str() {
+        "gguf" => true,
+        "safetensors" => false,
+        _ => {
+            // Auto-detect: if path ends in .gguf, use GGUF format
+            model_path.extension().is_some_and(|ext| ext == "gguf")
+        }
+    };
+
+    // Find tokenizer.json: next to the .gguf file or in the model directory
+    let tokenizer_path = if use_gguf {
+        model_path
+            .parent()
+            .unwrap_or(std::path::Path::new("."))
+            .join("tokenizer.json")
+    } else {
+        model_path.join("tokenizer.json")
+    };
+
     eprintln!("Loading tokenizer...");
-    let tokenizer_path = std::path::Path::new(&args.model_path).join("tokenizer.json");
     let tokenizer = Qwen3Tokenizer::new(&tokenizer_path).expect("Failed to load tokenizer");
 
+    let quantization = parse_quantization(&args.quantize);
     eprintln!("Loading model from {}...", args.model_path);
     let load_start = Instant::now();
-    let mut model = Qwen3::<B>::from_pretrained(&args.model_path, args.max_seq_len, &device)
-        .expect("Failed to load model");
+    let mut model = if use_gguf {
+        Qwen3::<B>::from_gguf(&args.model_path, args.max_seq_len, quantization, &device)
+            .expect("Failed to load GGUF model")
+    } else {
+        Qwen3::<B>::from_pretrained(&args.model_path, args.max_seq_len, quantization, &device)
+            .expect("Failed to load model")
+    };
     eprintln!("Model loaded in {:.1}s", load_start.elapsed().as_secs_f64());
 
     // Format prompt with chat template

@@ -3,6 +3,8 @@ pub mod sampling;
 pub mod tokenizer;
 
 pub(crate) mod cache;
+#[allow(dead_code)]
+pub(crate) mod gguf;
 pub(crate) mod transformer;
 
 #[cfg(feature = "bench")]
@@ -13,3 +15,5 @@ pub mod bench_internals {
         MultiHeadAttention, RmsNorm, RotaryEmbedding, Transformer, TransformerBlock,
     };
 }
+
+pub use model::QuantizationMode;

@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-qwen3-burn is a Rust library implementing Qwen3 LLM inference using the Burn 0.20 deep learning framework. It loads HuggingFace SafeTensors weights directly and runs on multiple backends (WGPU/Metal, NdArray/CPU, CUDA). The WGPU and CUDA backends use f16 inference for 2x memory reduction and higher throughput on supported hardware.
+qwen3-burn is a Rust library implementing Qwen3 LLM inference using the Burn 0.20 deep learning framework. It loads HuggingFace SafeTensors or GGUF pre-quantized weights and runs on multiple backends (WGPU/Metal, NdArray/CPU, CUDA). The WGPU and CUDA backends use f16 inference for 2x memory reduction and higher throughput on supported hardware.
 
 ## Architecture
 
@@ -21,14 +21,15 @@ Qwen3 is a decoder-only transformer with these distinguishing features vs Llama:
 
 ```
 src/
-  lib.rs           # Re-exports: model, sampling, tokenizer (cache & transformer are pub(crate)); bench_internals feature gate
-  model.rs         # Qwen3Config, Qwen3<B> (generate/generate_streaming), StopReason, GenerationEvent, GenerationParams, SafeTensors loading
+  lib.rs           # Re-exports: model, sampling, tokenizer, QuantizationMode (cache, gguf & transformer are pub(crate)); bench_internals feature gate
+  model.rs         # Qwen3Config, Qwen3<B> (generate/generate_streaming/from_gguf), StopReason, GenerationEvent, GenerationParams, QuantizationMode, SafeTensors & GGUF loading
+  gguf.rs          # GGUF binary format parser, dequantization (F32/F16/BF16/Q8_0/Q4_0), config extraction, tensor name mapping
   transformer.rs   # Transformer, TransformerBlock, Mlp (Dense/Moe), MoeLayer, MultiHeadAttention, FeedForward, RmsNorm, RotaryEmbedding
   cache.rs         # KvCache - pre-allocated [batch, heads, max_seq, head_dim] with sliding window
   sampling.rs      # Sampler enum: TopP (nucleus) and Argmax
   tokenizer.rs     # Qwen3Tokenizer wrapping HF `tokenizers` crate
 examples/
-  chat.rs          # CLI chat app with clap, feature-gated backend selection
+  chat.rs          # CLI chat app with clap, feature-gated backend selection, --format auto/safetensors/gguf
 benches/
   ops.rs           # Criterion benchmarks for all core ops (NdArray backend)
 ```
@@ -38,6 +39,8 @@ benches/
 PyTorch stores Linear weights as `[out_features, in_features]`; Burn stores as `[in_features, out_features]`. All Linear weights are **transposed** during loading (`take_linear_weight`). Embedding weights are loaded without transpose (`take_tensor_2d`). When `tie_word_embeddings=true`, the embedding weight is transposed and used as the lm_head weight.
 
 Weight loading streams shard-by-shard: after reading each safetensors file, completed layers are loaded into the model immediately and their f32 data is freed via `remove()` from the tensor map. This keeps peak memory close to the final model size (~1x) rather than ~2-3x.
+
+### SafeTensors Format
 
 SafeTensors key mapping (dense layers):
 - `model.embed_tokens.weight` -> Embedding
@@ -53,6 +56,27 @@ SafeTensors key mapping (MoE layers):
 - `model.layers.{i}.mlp.experts.{j}.up_proj.weight` -> 2D `[moe_intermediate, hidden]` (per-expert, transposed and packed with gate_proj)
 - `model.layers.{i}.mlp.experts.{j}.down_proj.weight` -> 2D `[hidden, moe_intermediate]` (per-expert, transposed and stacked into 3D)
 - `model.layers.{i}.mlp.gate.weight` -> 2D `[num_experts, hidden]` (router, no transpose)
+
+### GGUF Format
+
+GGUF loading (`Qwen3::from_gguf()`) uses a custom zero-dependency parser in `src/gguf.rs`. Config is extracted from GGUF metadata (no `config.json` needed); only a `tokenizer.json` alongside the `.gguf` file is required.
+
+**Critical**: GGUF stores tensor dimensions in **reversed order** (innermost-first, ggml convention). All dims are reversed when constructing Burn tensors.
+
+Supported GGUF quantization types: F32, F16, BF16, Q8_0, Q4_0. K-quant types (Q4_K_M, Q6_K) are not yet supported.
+
+When the GGUF source is Q8_0 or Q4_0, `from_gguf()` auto-detects the quantization and loads 2D linear weights directly into PackedU32 quantized format via per-tensor CPU quantization (dequant → transpose → requant per tensor). This avoids holding a full f32 model on GPU. The auto-detected mode can be overridden by the user's `QuantizationMode` argument; `QuantizationMode::None` upgrades to the detected mode. 1D weights (norms), embeddings, and 3D MoE expert weights always load as f32.
+
+The architecture prefix is read from `general.architecture` in GGUF metadata (typically `qwen3` for official Qwen3 GGUFs, or `qwen2` for older conversions). Key metadata fields (shown with `{arch}` prefix):
+- `{arch}.embedding_length` -> hidden_size
+- `{arch}.block_count` -> num_hidden_layers
+- `{arch}.attention.head_count` -> num_attention_heads
+- `{arch}.attention.head_count_kv` -> num_key_value_heads
+- `{arch}.feed_forward_length` -> intermediate_size
+- `tie_word_embeddings` inferred from absence of `output.weight` tensor
+- `vocab_size` inferred from `token_embd.weight` tensor shape
+
+GGUF tensor name mapping: `token_embd.weight`, `output_norm.weight`, `output.weight`, `blk.{i}.attn_q.weight`, etc. MoE experts stored as separate `ffn_gate_exps`/`ffn_up_exps` tensors, fused into `gate_up_proj` during loading.
 
 ## Build & Test
 
@@ -75,12 +99,24 @@ cargo bench --features bench              # All benchmarks
 cargo bench --features bench -- rms_norm  # Single group
 cargo bench --features bench -- "attention/decode"  # Subset
 
-# Run (needs model files in a directory: config.json, tokenizer.json, *.safetensors)
+# Run with SafeTensors (needs config.json, tokenizer.json, *.safetensors)
 cargo run --release --features wgpu --example chat -- \
   --model-path ./models/Qwen3-0.6B --prompt "Hello" --max-tokens 100
 
-# Download model files (Python)
+# Run with GGUF (auto-detected from .gguf extension; needs tokenizer.json next to .gguf file)
+cargo run --release --features wgpu --example chat -- \
+  --model-path ./models/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf --prompt "Hello" --max-tokens 100
+
+# Run with INT8 quantization (~4x memory reduction)
+cargo run --release --features wgpu --example chat -- \
+  --model-path ./models/Qwen3-0.6B --prompt "Hello" --quantize int8
+
+# Download SafeTensors model files (Python)
 python3 -c "from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen3-0.6B', local_dir='./models/Qwen3-0.6B', allow_patterns=['*.safetensors', 'config.json', 'tokenizer.json'])"
+
+# Download GGUF model (needs tokenizer.json from base model)
+# huggingface-cli download Qwen/Qwen3-0.6B-GGUF Qwen3-0.6B-Q8_0.gguf --local-dir ./models/Qwen3-0.6B-GGUF
+# huggingface-cli download Qwen/Qwen3-0.6B tokenizer.json --local-dir ./models/Qwen3-0.6B-GGUF
 ```
 
 Backend features are mutually exclusive: `wgpu` (Metal on macOS, f16), `ndarray` (CPU, f32), `cuda` (NVIDIA, f16). The `bench` feature is independent and only enables `bench_internals` re-exports for the benchmark harness.
@@ -89,7 +125,7 @@ Backend features are mutually exclusive: `wgpu` (Metal on macOS, f16), `ndarray`
 
 Always run `cargo fmt` before committing. Do not include model or agent attribution in commit messages (no "Co-Authored-By", "Generated by", etc.).
 
-Tests use `NdArray` backend (CPU) via dev-dependencies and require no model weights. 53 unit tests cover config parsing, streaming types, RmsNorm, RoPE, causal mask, KV cache (including overflow/truncation edge cases), MoE routing, sampling, and end-to-end shape verification for both dense and MoE transformer blocks.
+Tests use `NdArray` backend (CPU) via dev-dependencies and require no model weights. Unit tests cover config parsing, streaming types, RmsNorm, RoPE, causal mask, KV cache (including overflow/truncation edge cases), MoE routing, sampling, quantization, CPU quantization helpers (Q8S/Q4S block quantization), GGUF quantization auto-detection, GGUF dequantization (F32/F16/BF16/Q8_0/Q4_0), GGUF tensor name mapping, GGUF metadata accessors, and end-to-end shape verification for both dense and MoE transformer blocks.
 
 Criterion benchmarks (`benches/ops.rs`) measure all core ops parameterized by sequence length using Qwen3-0.6B dimensions. 48 benchmarks across 8 groups: rms_norm, rope, feed_forward, moe_layer, attention (prefill + decode), transformer_block (prefill + decode), causal_mask, kv_cache. Stateful ops (attention, transformer_block, kv_cache) use `iter_batched` with fresh caches per iteration. HTML reports are written to `target/criterion/`.
 
@@ -109,6 +145,18 @@ Criterion benchmarks (`benches/ops.rs`) measure all core ops parameterized by se
   - Optional chunked prefill: splits prompt into chunks of `prefill_chunk_size` tokens, reducing peak attention memory from O(N^2) to O(C*N)
   - Prefill chunks use `build_causal_mask(chunk_len, total_seq_len)` with the correct positional offset; KV cache accumulates across chunks. Decode steps (seq_len=1) skip the mask entirely (pass `None`) since a single query can attend to all cached positions.
   - `ControlFlow::Break(())` from the callback cancels generation early (yields `StopReason::Cancelled`)
+
+### Quantization
+
+- `QuantizationMode` enum: `None` (default), `Int8`, `Int4`
+- Uses Burn's native `Quantizer` with `QuantScheme` for real packed quantized storage (`PackedU32`)
+- `SelectiveQuantizer` wraps `burn::module::Quantizer` in a `ModuleMapper<B>` that skips sensitive parameters: 1D tensors (RMSNorm weights) and embedding weights (`embed_tokens`)
+- INT8: Q8S symmetric per-block (block size 32), `PackedU32` storage — requires GPU backend (WGPU/CUDA)
+- INT4: Q4S symmetric per-block (block size 32), `PackedU32` storage — requires GPU backend (WGPU/CUDA)
+- `from_pretrained()` accepts `QuantizationMode` and applies whole-model quantization via `SelectiveQuantizer` after loading
+- `from_gguf()` auto-detects Q8_0/Q4_0 and applies per-tensor quantized loading (dequant → CPU transpose → CPU requant → GPU upload per tensor), skipping the whole-model `apply_quantization` pass. Helper functions: `detect_gguf_quantization`, `quantize_q8s`/`quantize_q4s` (CPU block quantization), `make_2d_quantized` (transpose + quantize + `TensorData::quantized`)
+- **Contiguous workaround** (SafeTensors path only): Weight tensors are loaded as `[out, in]` then `.transpose()`d to `[in, out]`, creating non-contiguous memory views. Burn's block quantization computes scales over physical memory blocks but dequantization applies them over logical blocks, causing ~500x error for non-contiguous tensors. `SelectiveQuantizer` forces contiguity via `to_data()`/`from_data()` round-trip before quantizing (upstream Burn bug). The GGUF path avoids this by transposing f32 data on CPU before quantizing.
+- Note: WGPU has an open upstream issue (tracel-ai/burn#3997) that may affect quantization with autotune
 
 ### MoE Implementation
 
