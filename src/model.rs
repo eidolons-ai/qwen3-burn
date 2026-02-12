@@ -960,6 +960,7 @@ fn load_layer_weights<B: Backend>(
         let gate_proj_w =
             take_linear_weight(map, &format!("{}.mlp.gate_proj.weight", prefix), device)?;
         let up_proj_w = take_linear_weight(map, &format!("{}.mlp.up_proj.weight", prefix), device)?;
+        let gate_up_proj_w = Tensor::cat(vec![gate_proj_w, up_proj_w], 1);
         let down_proj_w =
             take_linear_weight(map, &format!("{}.mlp.down_proj.weight", prefix), device)?;
 
@@ -971,8 +972,7 @@ fn load_layer_weights<B: Backend>(
             o_proj_w,
             q_norm_w,
             k_norm_w,
-            gate_proj_w,
-            up_proj_w,
+            gate_up_proj_w,
             down_proj_w,
             input_ln_w,
             post_attn_ln_w,
@@ -1383,12 +1383,14 @@ pub(crate) fn load_gguf_weights<B: Backend>(
                 post_attn_ln_w,
             );
         } else {
-            // Dense layer: individual MLP weights, transpose each [out, in] -> [in, out]
-            let (gate_data, gate_shape) = read_tensor(file, &format!("blk.{}.ffn_gate.weight", i))?;
-            let gate_proj_w = make_2d_linear(gate_data, &gate_shape, device);
-
+            // Dense layer: fuse gate+up at f32 level before transpose/quantization
+            let (mut gate_up_data, gate_shape) =
+                read_tensor(file, &format!("blk.{}.ffn_gate.weight", i))?;
             let (up_data, up_shape) = read_tensor(file, &format!("blk.{}.ffn_up.weight", i))?;
-            let up_proj_w = make_2d_linear(up_data, &up_shape, device);
+            // Both are [intermediate, hidden]; concatenate rows → [2*intermediate, hidden]
+            gate_up_data.extend_from_slice(&up_data);
+            let gate_up_shape = vec![gate_shape[0] + up_shape[0], gate_shape[1]];
+            let gate_up_proj_w = make_2d_linear(gate_up_data, &gate_up_shape, device);
 
             let (down_data, down_shape) = read_tensor(file, &format!("blk.{}.ffn_down.weight", i))?;
             let down_proj_w = make_2d_linear(down_data, &down_shape, device);
@@ -1401,8 +1403,7 @@ pub(crate) fn load_gguf_weights<B: Backend>(
                 o_proj_w,
                 q_norm_w,
                 k_norm_w,
-                gate_proj_w,
-                up_proj_w,
+                gate_up_proj_w,
                 down_proj_w,
                 input_ln_w,
                 post_attn_ln_w,

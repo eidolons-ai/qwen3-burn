@@ -369,31 +369,36 @@ fn repeat_kv<B: Backend>(x: Tensor<B, 4>, n_rep: usize) -> Tensor<B, 4> {
 }
 
 /// SwiGLU feed-forward network.
+///
+/// Uses a fused gate+up projection: a single matmul produces both the gate and
+/// up activations (`[batch, seq, 2*intermediate]`), which are split and combined
+/// via `silu(gate) * up`. This halves the matmul dispatch count vs separate projections.
 #[derive(Module, Debug)]
 pub struct FeedForward<B: Backend> {
-    gate_proj: nn::Linear<B>,
-    up_proj: nn::Linear<B>,
+    gate_up_proj: nn::Linear<B>,
     down_proj: nn::Linear<B>,
+    intermediate_size: usize,
 }
 
 impl<B: Backend> FeedForward<B> {
     pub fn new(d_model: usize, intermediate_size: usize, device: &Device<B>) -> Self {
         Self {
-            gate_proj: nn::LinearConfig::new(d_model, intermediate_size)
-                .with_bias(false)
-                .init(device),
-            up_proj: nn::LinearConfig::new(d_model, intermediate_size)
+            gate_up_proj: nn::LinearConfig::new(d_model, 2 * intermediate_size)
                 .with_bias(false)
                 .init(device),
             down_proj: nn::LinearConfig::new(intermediate_size, d_model)
                 .with_bias(false)
                 .init(device),
+            intermediate_size,
         }
     }
 
     pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
-        let gate = activation::silu(self.gate_proj.forward(x.clone()));
-        let up = self.up_proj.forward(x);
+        let gate_up = self.gate_up_proj.forward(x);
+        let [b, s, _] = gate_up.dims();
+        let i = self.intermediate_size;
+        let gate = activation::silu(gate_up.clone().slice([0..b, 0..s, 0..i]));
+        let up = gate_up.slice([0..b, 0..s, i..2 * i]);
         self.down_proj.forward(gate * up)
     }
 }
@@ -1026,8 +1031,7 @@ impl<B: Backend> Transformer<B> {
         o_proj_w: Tensor<B, 2>,
         q_norm_w: Tensor<B, 1>,
         k_norm_w: Tensor<B, 1>,
-        gate_proj_w: Tensor<B, 2>,
-        up_proj_w: Tensor<B, 2>,
+        gate_up_proj_w: Tensor<B, 2>,
         down_proj_w: Tensor<B, 2>,
         input_ln_w: Tensor<B, 1>,
         post_attn_ln_w: Tensor<B, 1>,
@@ -1044,11 +1048,10 @@ impl<B: Backend> Transformer<B> {
         layer.self_attn.q_norm.weight = Param::from_tensor(q_norm_w);
         layer.self_attn.k_norm.weight = Param::from_tensor(k_norm_w);
 
-        // MLP (dense)
+        // MLP (dense): fused gate+up weight [hidden, 2*intermediate]
         match &mut layer.mlp {
             Mlp::Dense(ff) => {
-                ff.gate_proj.weight = Param::from_tensor(gate_proj_w);
-                ff.up_proj.weight = Param::from_tensor(up_proj_w);
+                ff.gate_up_proj.weight = Param::from_tensor(gate_up_proj_w);
                 ff.down_proj.weight = Param::from_tensor(down_proj_w);
             }
             Mlp::Moe(_) => panic!("load_layer called on MoE layer {}", layer_idx),

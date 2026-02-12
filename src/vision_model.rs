@@ -1181,6 +1181,7 @@ fn load_vl_text_layer<B: Backend>(
     let k_norm_w = take_tensor_1d(map, &format!("{}.self_attn.k_norm.weight", p), device)?;
     let gate_proj_w = take_linear_weight(map, &format!("{}.mlp.gate_proj.weight", p), device)?;
     let up_proj_w = take_linear_weight(map, &format!("{}.mlp.up_proj.weight", p), device)?;
+    let gate_up_proj_w = Tensor::cat(vec![gate_proj_w, up_proj_w], 1);
     let down_proj_w = take_linear_weight(map, &format!("{}.mlp.down_proj.weight", p), device)?;
     let input_ln_w = take_tensor_1d(map, &format!("{}.input_layernorm.weight", p), device)?;
     let post_attn_ln_w = take_tensor_1d(
@@ -1197,8 +1198,7 @@ fn load_vl_text_layer<B: Backend>(
         o_proj_w,
         q_norm_w,
         k_norm_w,
-        gate_proj_w,
-        up_proj_w,
+        gate_up_proj_w,
         down_proj_w,
         input_ln_w,
         post_attn_ln_w,

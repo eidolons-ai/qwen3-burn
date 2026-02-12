@@ -9,7 +9,7 @@ qwen3-burn is a Rust library implementing Qwen3 LLM inference using the Burn 0.2
 Qwen3 is a decoder-only transformer with these distinguishing features vs Llama:
 - **QK-Norm**: RMSNorm applied to Q and K projections *before* RoPE (unique to Qwen3)
 - **GQA**: Grouped-query attention with consistently 8 KV heads (dense) or 4 KV heads (MoE) across model sizes
-- **SwiGLU**: `down_proj(silu(gate_proj(x)) * up_proj(x))`
+- **SwiGLU**: `down_proj(silu(gate) * up)` where `[gate, up] = gate_up_proj(x)` (fused single matmul)
 - **RoPE**: theta=1,000,000, head_dim=128
 - **RMSNorm**: eps=1e-6 (Llama uses 1e-5)
 - **No bias** in any linear layers
@@ -46,7 +46,8 @@ SafeTensors key mapping (dense layers):
 - `model.embed_tokens.weight` -> Embedding
 - `model.layers.{i}.self_attn.{q,k,v,o}_proj.weight` -> Linear (transposed)
 - `model.layers.{i}.self_attn.{q,k}_norm.weight` -> RmsNorm (1D)
-- `model.layers.{i}.mlp.{gate,up,down}_proj.weight` -> Linear (transposed)
+- `model.layers.{i}.mlp.{gate,up}_proj.weight` -> Loaded separately, concatenated into fused `gate_up_proj` Linear `[hidden, 2*intermediate]` (transposed)
+- `model.layers.{i}.mlp.down_proj.weight` -> Linear (transposed)
 - `model.layers.{i}.{input,post_attention}_layernorm.weight` -> RmsNorm (1D)
 - `model.norm.weight` -> final RmsNorm
 - `lm_head.weight` -> Linear (transposed, or tied with embedding)
