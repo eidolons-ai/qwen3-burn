@@ -7,9 +7,10 @@ qwen3-burn is a Rust library implementing Qwen3 LLM inference using the Burn 0.2
 ## Architecture
 
 Qwen3 is a decoder-only transformer with these distinguishing features vs Llama:
+- **Fused QKV**: Q, K, V projections fused into single `qkv_proj` matmul `[d_model, q_dim + 2*kv_dim]`, output split via slicing
 - **QK-Norm**: RMSNorm applied to Q and K projections *before* RoPE (unique to Qwen3)
 - **GQA**: Grouped-query attention with consistently 8 KV heads (dense) or 4 KV heads (MoE) across model sizes
-- **SwiGLU**: `down_proj(silu(gate_proj(x)) * up_proj(x))`
+- **SwiGLU**: `down_proj(silu(gate) * up)` where `[gate, up] = gate_up_proj(x)` (fused single matmul)
 - **RoPE**: theta=1,000,000, head_dim=128
 - **RMSNorm**: eps=1e-6 (Llama uses 1e-5)
 - **No bias** in any linear layers
@@ -44,9 +45,11 @@ Weight loading streams shard-by-shard: after reading each safetensors file, comp
 
 SafeTensors key mapping (dense layers):
 - `model.embed_tokens.weight` -> Embedding
-- `model.layers.{i}.self_attn.{q,k,v,o}_proj.weight` -> Linear (transposed)
+- `model.layers.{i}.self_attn.{q,k,v}_proj.weight` -> Loaded separately, transposed, concatenated into fused `qkv_proj` Linear `[d_model, q_dim + 2*kv_dim]`
+- `model.layers.{i}.self_attn.o_proj.weight` -> Linear (transposed)
 - `model.layers.{i}.self_attn.{q,k}_norm.weight` -> RmsNorm (1D)
-- `model.layers.{i}.mlp.{gate,up,down}_proj.weight` -> Linear (transposed)
+- `model.layers.{i}.mlp.{gate,up}_proj.weight` -> Loaded separately, concatenated into fused `gate_up_proj` Linear `[hidden, 2*intermediate]` (transposed)
+- `model.layers.{i}.mlp.down_proj.weight` -> Linear (transposed)
 - `model.layers.{i}.{input,post_attention}_layernorm.weight` -> RmsNorm (1D)
 - `model.norm.weight` -> final RmsNorm
 - `lm_head.weight` -> Linear (transposed, or tied with embedding)
@@ -76,7 +79,7 @@ The architecture prefix is read from `general.architecture` in GGUF metadata (ty
 - `tie_word_embeddings` inferred from absence of `output.weight` tensor
 - `vocab_size` inferred from `token_embd.weight` tensor shape
 
-GGUF tensor name mapping: `token_embd.weight`, `output_norm.weight`, `output.weight`, `blk.{i}.attn_q.weight`, etc. MoE experts stored as separate `ffn_gate_exps`/`ffn_up_exps` tensors, fused into `gate_up_proj` during loading.
+GGUF tensor name mapping: `token_embd.weight`, `output_norm.weight`, `output.weight`, `blk.{i}.attn_q.weight`, etc. Q/K/V weights are concatenated at f32 level into fused `qkv_proj` before transpose/quantization. MoE experts stored as separate `ffn_gate_exps`/`ffn_up_exps` tensors, fused into `gate_up_proj` during loading.
 
 ## Build & Test
 
@@ -203,7 +206,7 @@ All other operations (matmuls, attention, SwiGLU, embedding lookup) run natively
 
 ## Performance
 
-Qwen3-0.6B on Apple Silicon (M-series, Metal via WGPU, f16): ~23-26 tokens/s, model loads in <1s.
+Qwen3-0.6B on Apple Silicon (M-series, Metal via WGPU, f16): ~22-26 tokens/s, model loads in <1s.
 
 ## Qwen3 Chat Template
 

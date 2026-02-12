@@ -657,14 +657,17 @@ impl<B: Backend> Qwen3<B> {
         all_tokens.push(next_token);
         generated_count += 1;
 
+        // Accumulate decoded text incrementally to avoid re-decoding the entire
+        // generated sequence on every step (which is O(n²) in total).
+        let mut decoded_text = tokenizer.decode(&[next_token]);
+
         let stop_reason = if next_token == eos_token {
             StopReason::Eos
         } else {
             // Emit first token
-            let text = tokenizer.decode(&all_tokens[prompt_len..]);
             if callback(GenerationEvent::Token {
                 token_id: next_token,
-                text,
+                text: decoded_text.clone(),
                 tokens_generated: generated_count,
             })
             .is_break()
@@ -677,7 +680,7 @@ impl<B: Backend> Qwen3<B> {
                     stop_reason: StopReason::Cancelled,
                 });
                 return Ok(GenerationOutput {
-                    text: tokenizer.decode(&all_tokens[prompt_len..]),
+                    text: decoded_text,
                     tokens: generated_count,
                     time: elapsed,
                 });
@@ -708,10 +711,10 @@ impl<B: Backend> Qwen3<B> {
                     break;
                 }
 
-                let text = tokenizer.decode(&all_tokens[prompt_len..]);
+                decoded_text.push_str(&tokenizer.decode(&[next_token]));
                 if callback(GenerationEvent::Token {
                     token_id: next_token,
-                    text,
+                    text: decoded_text.clone(),
                     tokens_generated: generated_count,
                 })
                 .is_break()
@@ -731,7 +734,7 @@ impl<B: Backend> Qwen3<B> {
             stop_reason,
         });
         Ok(GenerationOutput {
-            text: tokenizer.decode(&all_tokens[prompt_len..]),
+            text: decoded_text,
             tokens: generated_count,
             time: elapsed,
         })
@@ -895,6 +898,8 @@ fn load_layer_weights<B: Backend>(
     let q_proj_w = take_linear_weight(map, &format!("{}.self_attn.q_proj.weight", prefix), device)?;
     let k_proj_w = take_linear_weight(map, &format!("{}.self_attn.k_proj.weight", prefix), device)?;
     let v_proj_w = take_linear_weight(map, &format!("{}.self_attn.v_proj.weight", prefix), device)?;
+    // Fuse Q, K, V into single weight: each is [d_model, *_dim], cat along dim 1
+    let qkv_proj_w = Tensor::cat(vec![q_proj_w, k_proj_w, v_proj_w], 1);
     let o_proj_w = take_linear_weight(map, &format!("{}.self_attn.o_proj.weight", prefix), device)?;
     let q_norm_w = take_tensor_1d(map, &format!("{}.self_attn.q_norm.weight", prefix), device)?;
     let k_norm_w = take_tensor_1d(map, &format!("{}.self_attn.k_norm.weight", prefix), device)?;
@@ -941,9 +946,7 @@ fn load_layer_weights<B: Backend>(
 
         Ok(transformer.load_moe_layer(
             layer_idx,
-            q_proj_w,
-            k_proj_w,
-            v_proj_w,
+            qkv_proj_w,
             o_proj_w,
             q_norm_w,
             k_norm_w,
@@ -957,19 +960,17 @@ fn load_layer_weights<B: Backend>(
         let gate_proj_w =
             take_linear_weight(map, &format!("{}.mlp.gate_proj.weight", prefix), device)?;
         let up_proj_w = take_linear_weight(map, &format!("{}.mlp.up_proj.weight", prefix), device)?;
+        let gate_up_proj_w = Tensor::cat(vec![gate_proj_w, up_proj_w], 1);
         let down_proj_w =
             take_linear_weight(map, &format!("{}.mlp.down_proj.weight", prefix), device)?;
 
         Ok(transformer.load_layer(
             layer_idx,
-            q_proj_w,
-            k_proj_w,
-            v_proj_w,
+            qkv_proj_w,
             o_proj_w,
             q_norm_w,
             k_norm_w,
-            gate_proj_w,
-            up_proj_w,
+            gate_up_proj_w,
             down_proj_w,
             input_ln_w,
             post_attn_ln_w,
@@ -1312,16 +1313,15 @@ pub(crate) fn load_gguf_weights<B: Backend>(
             eprintln!("Loading layer {}/{}...", i, config.num_hidden_layers);
         }
 
-        // Attention projections — GGUF stores [out, in] (PyTorch convention after dim reversal),
-        // Burn needs [in, out], so transpose. When quantizing, this is done on CPU.
-        let (q_data, q_shape) = read_tensor(file, &format!("blk.{}.attn_q.weight", i))?;
-        let q_proj_w = make_2d_linear(q_data, &q_shape, device);
-
+        // Fuse Q, K, V at f32 level before transpose/quantization (same approach as gate+up).
+        // All are [out, hidden] after GGUF dim reversal; concatenate rows → [q_out+k_out+v_out, hidden].
+        let (mut qkv_data, q_shape) = read_tensor(file, &format!("blk.{}.attn_q.weight", i))?;
         let (k_data, k_shape) = read_tensor(file, &format!("blk.{}.attn_k.weight", i))?;
-        let k_proj_w = make_2d_linear(k_data, &k_shape, device);
-
         let (v_data, v_shape) = read_tensor(file, &format!("blk.{}.attn_v.weight", i))?;
-        let v_proj_w = make_2d_linear(v_data, &v_shape, device);
+        qkv_data.extend_from_slice(&k_data);
+        qkv_data.extend_from_slice(&v_data);
+        let qkv_shape = vec![q_shape[0] + k_shape[0] + v_shape[0], q_shape[1]];
+        let qkv_proj_w = make_2d_linear(qkv_data, &qkv_shape, device);
 
         let (o_data, o_shape) = read_tensor(file, &format!("blk.{}.attn_output.weight", i))?;
         let o_proj_w = make_2d_linear(o_data, &o_shape, device);
@@ -1367,9 +1367,7 @@ pub(crate) fn load_gguf_weights<B: Backend>(
 
             transformer = transformer.load_moe_layer(
                 i,
-                q_proj_w,
-                k_proj_w,
-                v_proj_w,
+                qkv_proj_w,
                 o_proj_w,
                 q_norm_w,
                 k_norm_w,
@@ -1380,26 +1378,25 @@ pub(crate) fn load_gguf_weights<B: Backend>(
                 post_attn_ln_w,
             );
         } else {
-            // Dense layer: individual MLP weights, transpose each [out, in] -> [in, out]
-            let (gate_data, gate_shape) = read_tensor(file, &format!("blk.{}.ffn_gate.weight", i))?;
-            let gate_proj_w = make_2d_linear(gate_data, &gate_shape, device);
-
+            // Dense layer: fuse gate+up at f32 level before transpose/quantization
+            let (mut gate_up_data, gate_shape) =
+                read_tensor(file, &format!("blk.{}.ffn_gate.weight", i))?;
             let (up_data, up_shape) = read_tensor(file, &format!("blk.{}.ffn_up.weight", i))?;
-            let up_proj_w = make_2d_linear(up_data, &up_shape, device);
+            // Both are [intermediate, hidden]; concatenate rows → [2*intermediate, hidden]
+            gate_up_data.extend_from_slice(&up_data);
+            let gate_up_shape = vec![gate_shape[0] + up_shape[0], gate_shape[1]];
+            let gate_up_proj_w = make_2d_linear(gate_up_data, &gate_up_shape, device);
 
             let (down_data, down_shape) = read_tensor(file, &format!("blk.{}.ffn_down.weight", i))?;
             let down_proj_w = make_2d_linear(down_data, &down_shape, device);
 
             transformer = transformer.load_layer(
                 i,
-                q_proj_w,
-                k_proj_w,
-                v_proj_w,
+                qkv_proj_w,
                 o_proj_w,
                 q_norm_w,
                 k_norm_w,
-                gate_proj_w,
-                up_proj_w,
+                gate_up_proj_w,
                 down_proj_w,
                 input_ln_w,
                 post_attn_ln_w,

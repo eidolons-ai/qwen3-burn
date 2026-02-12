@@ -140,9 +140,7 @@ pub fn apply_rotary<B: Backend>(
 /// Multi-head attention with grouped-query attention and QK-Norm.
 #[derive(Module, Debug)]
 pub struct MultiHeadAttention<B: Backend> {
-    q_proj: nn::Linear<B>,
-    k_proj: nn::Linear<B>,
-    v_proj: nn::Linear<B>,
+    qkv_proj: nn::Linear<B>,
     o_proj: nn::Linear<B>,
     q_norm: RmsNorm<B>,
     k_norm: RmsNorm<B>,
@@ -190,13 +188,7 @@ impl<B: Backend> MultiHeadAttention<B> {
         let kv_dim = num_kv_heads * head_dim;
 
         Self {
-            q_proj: nn::LinearConfig::new(d_model, q_dim)
-                .with_bias(false)
-                .init(device),
-            k_proj: nn::LinearConfig::new(d_model, kv_dim)
-                .with_bias(false)
-                .init(device),
-            v_proj: nn::LinearConfig::new(d_model, kv_dim)
+            qkv_proj: nn::LinearConfig::new(d_model, q_dim + 2 * kv_dim)
                 .with_bias(false)
                 .init(device),
             o_proj: nn::LinearConfig::new(q_dim, d_model)
@@ -214,23 +206,28 @@ impl<B: Backend> MultiHeadAttention<B> {
     ///
     /// - `x`: `[batch, seq_len, d_model]`
     /// - `rope`: Rotary position embeddings
-    /// - `mask`: Causal attention mask `[seq_len, total_seq_len]`
+    /// - `mask`: Causal attention mask `[1, 1, q_seq, kv_seq]` (pre-unsqueezed for broadcasting)
     /// - `cache`: Optional KV cache for autoregressive generation
     /// - `start_pos`: Position offset for RoPE
     pub fn forward(
         &self,
         x: Tensor<B, 3>,
         rope: &RotaryEmbedding<B>,
-        mask: Option<Tensor<B, 2>>,
+        mask: Option<Tensor<B, 4>>,
         cache: &mut AttentionKvCache<B>,
         start_pos: usize,
     ) -> Tensor<B, 3> {
         let [batch, seq_len, _d_model] = x.dims();
 
-        // Project Q, K, V
-        let q = self.q_proj.forward(x.clone());
-        let k = self.k_proj.forward(x.clone());
-        let v = self.v_proj.forward(x);
+        // Fused QKV projection: single matmul → split
+        let qkv = self.qkv_proj.forward(x);
+        let q_dim = self.num_heads * self.head_dim;
+        let kv_dim = self.num_kv_heads * self.head_dim;
+        let q = qkv.clone().slice([0..batch, 0..seq_len, 0..q_dim]);
+        let k = qkv
+            .clone()
+            .slice([0..batch, 0..seq_len, q_dim..q_dim + kv_dim]);
+        let v = qkv.slice([0..batch, 0..seq_len, q_dim + kv_dim..q_dim + 2 * kv_dim]);
 
         // Reshape to [batch, seq_len, num_heads, head_dim]
         let q = q.reshape([batch, seq_len, self.num_heads, self.head_dim]);
@@ -268,9 +265,9 @@ impl<B: Backend> MultiHeadAttention<B> {
         let scale = (self.head_dim as f64).sqrt().recip();
         let attn_weights = q.matmul(k.transpose()) * scale;
 
-        // Apply causal mask: mask is [q_seq, kv_seq], expand to [1, 1, q_seq, kv_seq]
+        // Apply causal mask (already [1, 1, q_seq, kv_seq] for broadcasting)
         let attn_weights = if let Some(mask) = mask {
-            attn_weights + mask.unsqueeze::<3>().unsqueeze::<4>()
+            attn_weights + mask
         } else {
             attn_weights
         };
@@ -297,14 +294,20 @@ impl<B: Backend> MultiHeadAttention<B> {
         x: Tensor<B, 3>,
         cos: Tensor<B, 2>,
         sin: Tensor<B, 2>,
-        mask: Option<Tensor<B, 2>>,
+        mask: Option<Tensor<B, 4>>,
         cache: &mut AttentionKvCache<B>,
     ) -> Tensor<B, 3> {
         let [batch, seq_len, _d_model] = x.dims();
 
-        let q = self.q_proj.forward(x.clone());
-        let k = self.k_proj.forward(x.clone());
-        let v = self.v_proj.forward(x);
+        // Fused QKV projection: single matmul → split
+        let qkv = self.qkv_proj.forward(x);
+        let q_dim = self.num_heads * self.head_dim;
+        let kv_dim = self.num_kv_heads * self.head_dim;
+        let q = qkv.clone().slice([0..batch, 0..seq_len, 0..q_dim]);
+        let k = qkv
+            .clone()
+            .slice([0..batch, 0..seq_len, q_dim..q_dim + kv_dim]);
+        let v = qkv.slice([0..batch, 0..seq_len, q_dim + kv_dim..q_dim + 2 * kv_dim]);
 
         let q = q.reshape([batch, seq_len, self.num_heads, self.head_dim]);
         let k = k.reshape([batch, seq_len, self.num_kv_heads, self.head_dim]);
@@ -338,7 +341,7 @@ impl<B: Backend> MultiHeadAttention<B> {
         let attn_weights = q.matmul(k.transpose()) * scale;
 
         let attn_weights = if let Some(mask) = mask {
-            attn_weights + mask.unsqueeze::<3>().unsqueeze::<4>()
+            attn_weights + mask
         } else {
             attn_weights
         };
@@ -369,31 +372,36 @@ fn repeat_kv<B: Backend>(x: Tensor<B, 4>, n_rep: usize) -> Tensor<B, 4> {
 }
 
 /// SwiGLU feed-forward network.
+///
+/// Uses a fused gate+up projection: a single matmul produces both the gate and
+/// up activations (`[batch, seq, 2*intermediate]`), which are split and combined
+/// via `silu(gate) * up`. This halves the matmul dispatch count vs separate projections.
 #[derive(Module, Debug)]
 pub struct FeedForward<B: Backend> {
-    gate_proj: nn::Linear<B>,
-    up_proj: nn::Linear<B>,
+    gate_up_proj: nn::Linear<B>,
     down_proj: nn::Linear<B>,
+    intermediate_size: usize,
 }
 
 impl<B: Backend> FeedForward<B> {
     pub fn new(d_model: usize, intermediate_size: usize, device: &Device<B>) -> Self {
         Self {
-            gate_proj: nn::LinearConfig::new(d_model, intermediate_size)
-                .with_bias(false)
-                .init(device),
-            up_proj: nn::LinearConfig::new(d_model, intermediate_size)
+            gate_up_proj: nn::LinearConfig::new(d_model, 2 * intermediate_size)
                 .with_bias(false)
                 .init(device),
             down_proj: nn::LinearConfig::new(intermediate_size, d_model)
                 .with_bias(false)
                 .init(device),
+            intermediate_size,
         }
     }
 
     pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
-        let gate = activation::silu(self.gate_proj.forward(x.clone()));
-        let up = self.up_proj.forward(x);
+        let gate_up = self.gate_up_proj.forward(x);
+        let [b, s, _] = gate_up.dims();
+        let i = self.intermediate_size;
+        let gate = activation::silu(gate_up.clone().slice([0..b, 0..s, 0..i]));
+        let up = gate_up.slice([0..b, 0..s, i..2 * i]);
         self.down_proj.forward(gate * up)
     }
 }
@@ -749,7 +757,7 @@ impl<B: Backend> TransformerBlock<B> {
         &self,
         x: Tensor<B, 3>,
         rope: &RotaryEmbedding<B>,
-        mask: Option<Tensor<B, 2>>,
+        mask: Option<Tensor<B, 4>>,
         cache: &mut AttentionKvCache<B>,
         start_pos: usize,
     ) -> Tensor<B, 3> {
@@ -778,7 +786,7 @@ impl<B: Backend> TransformerBlock<B> {
         x: Tensor<B, 3>,
         cos: Tensor<B, 2>,
         sin: Tensor<B, 2>,
-        mask: Option<Tensor<B, 2>>,
+        mask: Option<Tensor<B, 4>>,
         cache: &mut AttentionKvCache<B>,
     ) -> Tensor<B, 3> {
         let x = {
@@ -909,6 +917,9 @@ impl<B: Backend> Transformer<B> {
     ) -> Tensor<B, 3> {
         let mut x = self.embed_tokens.forward(tokens);
 
+        // Pre-unsqueeze mask once: [q_seq, kv_seq] → [1, 1, q_seq, kv_seq]
+        let mask = mask.map(|m| m.unsqueeze::<3>().unsqueeze::<4>());
+
         for (i, layer) in self.layers.iter().enumerate() {
             let kind = match &layer.mlp {
                 Mlp::Dense(_) => "dense",
@@ -954,6 +965,9 @@ impl<B: Backend> Transformer<B> {
         deepstack: Option<(&[Tensor<B, 3>], Tensor<B, 3>, &[usize])>,
     ) -> Tensor<B, 3> {
         let mut x = embeddings;
+
+        // Pre-unsqueeze mask once: [q_seq, kv_seq] → [1, 1, q_seq, kv_seq]
+        let mask = mask.map(|m| m.unsqueeze::<3>().unsqueeze::<4>());
 
         for (i, layer) in self.layers.iter().enumerate() {
             let kind = match &layer.mlp {
@@ -1020,35 +1034,29 @@ impl<B: Backend> Transformer<B> {
     pub fn load_layer(
         mut self,
         layer_idx: usize,
-        q_proj_w: Tensor<B, 2>,
-        k_proj_w: Tensor<B, 2>,
-        v_proj_w: Tensor<B, 2>,
+        qkv_proj_w: Tensor<B, 2>,
         o_proj_w: Tensor<B, 2>,
         q_norm_w: Tensor<B, 1>,
         k_norm_w: Tensor<B, 1>,
-        gate_proj_w: Tensor<B, 2>,
-        up_proj_w: Tensor<B, 2>,
+        gate_up_proj_w: Tensor<B, 2>,
         down_proj_w: Tensor<B, 2>,
         input_ln_w: Tensor<B, 1>,
         post_attn_ln_w: Tensor<B, 1>,
     ) -> Self {
         let layer = &mut self.layers[layer_idx];
 
-        // Attention projections
-        layer.self_attn.q_proj.weight = Param::from_tensor(q_proj_w);
-        layer.self_attn.k_proj.weight = Param::from_tensor(k_proj_w);
-        layer.self_attn.v_proj.weight = Param::from_tensor(v_proj_w);
+        // Attention projections (fused QKV)
+        layer.self_attn.qkv_proj.weight = Param::from_tensor(qkv_proj_w);
         layer.self_attn.o_proj.weight = Param::from_tensor(o_proj_w);
 
         // QK-Norm
         layer.self_attn.q_norm.weight = Param::from_tensor(q_norm_w);
         layer.self_attn.k_norm.weight = Param::from_tensor(k_norm_w);
 
-        // MLP (dense)
+        // MLP (dense): fused gate+up weight [hidden, 2*intermediate]
         match &mut layer.mlp {
             Mlp::Dense(ff) => {
-                ff.gate_proj.weight = Param::from_tensor(gate_proj_w);
-                ff.up_proj.weight = Param::from_tensor(up_proj_w);
+                ff.gate_up_proj.weight = Param::from_tensor(gate_up_proj_w);
                 ff.down_proj.weight = Param::from_tensor(down_proj_w);
             }
             Mlp::Moe(_) => panic!("load_layer called on MoE layer {}", layer_idx),
@@ -1070,9 +1078,7 @@ impl<B: Backend> Transformer<B> {
     pub fn load_moe_layer(
         mut self,
         layer_idx: usize,
-        q_proj_w: Tensor<B, 2>,
-        k_proj_w: Tensor<B, 2>,
-        v_proj_w: Tensor<B, 2>,
+        qkv_proj_w: Tensor<B, 2>,
         o_proj_w: Tensor<B, 2>,
         q_norm_w: Tensor<B, 1>,
         k_norm_w: Tensor<B, 1>,
@@ -1084,10 +1090,8 @@ impl<B: Backend> Transformer<B> {
     ) -> Self {
         let layer = &mut self.layers[layer_idx];
 
-        // Attention projections
-        layer.self_attn.q_proj.weight = Param::from_tensor(q_proj_w);
-        layer.self_attn.k_proj.weight = Param::from_tensor(k_proj_w);
-        layer.self_attn.v_proj.weight = Param::from_tensor(v_proj_w);
+        // Attention projections (fused QKV)
+        layer.self_attn.qkv_proj.weight = Param::from_tensor(qkv_proj_w);
         layer.self_attn.o_proj.weight = Param::from_tensor(o_proj_w);
 
         // QK-Norm
@@ -1114,22 +1118,22 @@ impl<B: Backend> Transformer<B> {
 
 /// Build a causal attention mask of shape `[seq_len, total_seq_len]`.
 /// Positions that should not be attended to get `f32::NEG_INFINITY`.
+/// Constructed on-device using tensor ops to avoid CPU→GPU transfer of O(N²) mask data.
 pub fn build_causal_mask<B: Backend>(
     seq_len: usize,
     total_seq_len: usize,
     device: &Device<B>,
 ) -> Tensor<B, 2> {
-    // Create upper triangular mask: mask[i][j] = -inf if j > i + offset
-    let offset = total_seq_len - seq_len;
-    let mut mask_data = vec![0.0f32; seq_len * total_seq_len];
-    for i in 0..seq_len {
-        for j in 0..total_seq_len {
-            if j > i + offset {
-                mask_data[i * total_seq_len + j] = f32::NEG_INFINITY;
-            }
-        }
-    }
-    Tensor::<B, 1>::from_floats(&mask_data[..], device).reshape([seq_len, total_seq_len])
+    let offset = (total_seq_len - seq_len) as i64;
+    // Row indices [0..seq_len] → [seq_len, 1] for broadcasting
+    let rows = Tensor::<B, 1, Int>::arange(0..seq_len as i64, device).reshape([seq_len, 1]);
+    // Col indices [0..total_seq_len] → [1, total_seq_len] for broadcasting
+    let cols =
+        Tensor::<B, 1, Int>::arange(0..total_seq_len as i64, device).reshape([1, total_seq_len]);
+    // mask_bool[i][j] = true where j > i + offset (future positions to mask)
+    let mask_bool = cols.greater(rows + offset);
+    // 0.0 for attendable positions, -inf for masked positions
+    Tensor::<B, 2>::zeros([seq_len, total_seq_len], device).mask_fill(mask_bool, f32::NEG_INFINITY)
 }
 
 #[cfg(test)]
@@ -1434,7 +1438,9 @@ mod tests {
         let block = TransformerBlock::new(32, 4, 2, 8, 64, 1e-6, &dev);
         let rope = RotaryEmbedding::new(8, 16, 10000.0, &dev);
         let mut cache = AttentionKvCache::new(1, 2, 16, 8, &dev);
-        let mask = build_causal_mask::<B>(3, 3, &dev);
+        let mask = build_causal_mask::<B>(3, 3, &dev)
+            .unsqueeze::<3>()
+            .unsqueeze::<4>();
 
         let x = Tensor::<B, 3>::ones([1, 3, 32], &dev);
         let out = block.forward(x, &rope, Some(mask), &mut cache, 0);
@@ -1447,7 +1453,9 @@ mod tests {
         let block = TransformerBlock::new_moe(32, 4, 2, 8, 4, 2, 16, true, 1e-6, &dev);
         let rope = RotaryEmbedding::new(8, 16, 10000.0, &dev);
         let mut cache = AttentionKvCache::new(1, 2, 16, 8, &dev);
-        let mask = build_causal_mask::<B>(3, 3, &dev);
+        let mask = build_causal_mask::<B>(3, 3, &dev)
+            .unsqueeze::<3>()
+            .unsqueeze::<4>();
 
         let x = Tensor::<B, 3>::ones([1, 3, 32], &dev);
         let out = block.forward(x, &rope, Some(mask), &mut cache, 0);
