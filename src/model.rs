@@ -1226,7 +1226,7 @@ fn make_2d_quantized<B: Backend>(
 /// Detect quantization mode from GGUF tensor dtypes.
 ///
 /// Checks a representative weight tensor to determine the source quantization.
-fn detect_gguf_quantization(gguf_file: &gguf::GgufFile) -> QuantizationMode {
+pub(crate) fn detect_gguf_quantization(gguf_file: &gguf::GgufFile) -> QuantizationMode {
     // Check the first attention weight tensor
     let dtype = gguf_file
         .tensor_dtype("blk.0.attn_q.weight")
@@ -1248,7 +1248,7 @@ fn detect_gguf_quantization(gguf_file: &gguf::GgufFile) -> QuantizationMode {
 ///
 /// When `quant_scheme` is `Some`, 2D linear weights are quantized per-tensor on CPU
 /// before being sent to the device, avoiding a full f32 model on GPU.
-fn load_gguf_weights<B: Backend>(
+pub(crate) fn load_gguf_weights<B: Backend>(
     mut transformer: Transformer<B>,
     gguf_file: &gguf::GgufFile,
     file: &mut std::fs::File,
@@ -1488,7 +1488,7 @@ impl<B: Backend> burn::module::ModuleMapper<B> for SelectiveQuantizer {
 /// Weights are stored in quantized format with `PackedU32` storage for real
 /// memory savings on GPU backends (WGPU, CUDA). NdArray does not support
 /// `PackedU32`; quantization requires a GPU backend.
-fn apply_quantization<B: Backend>(
+pub(crate) fn apply_quantization<B: Backend>(
     transformer: Transformer<B>,
     mode: QuantizationMode,
 ) -> Transformer<B> {

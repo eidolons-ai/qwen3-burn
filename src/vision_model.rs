@@ -7,7 +7,11 @@ use burn::prelude::*;
 use burn::tensor::TensorData;
 use serde::Deserialize;
 
-use crate::model::{GenerationEvent, GenerationOutput, StopReason};
+use crate::gguf;
+use crate::model::{
+    apply_quantization, detect_gguf_quantization, load_gguf_weights, GenerationEvent,
+    GenerationOutput, QuantizationMode, StopReason,
+};
 use crate::mrope::{self, MRopeEmbedding};
 use crate::sampling::Sampler;
 use crate::tokenizer::Qwen3Tokenizer;
@@ -205,6 +209,230 @@ impl<B: Backend> Qwen3VL<B> {
         let caches = (0..tc.num_hidden_layers)
             .map(|_| {
                 AttentionKvCache::new(1, tc.num_key_value_heads, max_seq_len, tc.head_dim, device)
+            })
+            .collect();
+
+        Ok(Self {
+            transformer,
+            vision_encoder,
+            mrope,
+            caches,
+            config,
+            max_seq_len,
+            device: device.clone(),
+        })
+    }
+
+    /// Load a Qwen3-VL model from a GGUF file (text decoder) plus an mmproj GGUF
+    /// (vision encoder) in the same directory.
+    ///
+    /// The mmproj file is auto-discovered by scanning for `mmproj-*.gguf` in the
+    /// same directory as the main GGUF file.
+    pub fn from_gguf(
+        gguf_path: impl AsRef<Path>,
+        max_seq_len: usize,
+        quantization: QuantizationMode,
+        device: &Device<B>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let gguf_path = gguf_path.as_ref();
+
+        // 1. Parse main GGUF (text decoder)
+        let (gguf_file, mut file) = gguf::GgufFile::open(gguf_path)?;
+
+        // 2. Extract text config from GGUF metadata
+        let text_config_raw = gguf::extract_config(&gguf_file)?;
+        eprintln!(
+            "GGUF VL text config: hidden={}, layers={}, heads={}, kv_heads={}, vocab={}",
+            text_config_raw.hidden_size,
+            text_config_raw.num_hidden_layers,
+            text_config_raw.num_attention_heads,
+            text_config_raw.num_key_value_heads,
+            text_config_raw.vocab_size,
+        );
+
+        // 3. Find mmproj file in the same directory
+        let gguf_dir = gguf_path.parent().unwrap_or_else(|| Path::new("."));
+        let mmproj_path = find_mmproj_gguf(gguf_dir)?;
+        eprintln!("Found mmproj: {}", mmproj_path.display());
+
+        // 4. Parse mmproj GGUF
+        let (mmproj_gguf, mut mmproj_file) = gguf::GgufFile::open(&mmproj_path)?;
+
+        // Log mmproj tensor names for debugging
+        let mut mmproj_names: Vec<&String> = mmproj_gguf.tensors.keys().collect();
+        mmproj_names.sort();
+        eprintln!("mmproj tensors ({}):", mmproj_names.len());
+        for name in &mmproj_names {
+            eprintln!("  {}", name);
+        }
+
+        // 5. Extract vision config from mmproj metadata
+        let vision_config = gguf::extract_vision_config(&mmproj_gguf, text_config_raw.hidden_size)?;
+        eprintln!(
+            "  vision: hidden={}, depth={}, heads={}, out_hidden={}, patch={}",
+            vision_config.hidden_size,
+            vision_config.depth,
+            vision_config.num_heads,
+            vision_config.out_hidden_size,
+            vision_config.patch_size,
+        );
+        if let Some(ref ds) = vision_config.deepstack_visual_indexes {
+            eprintln!("  deepstack indexes: {:?}", ds);
+        }
+
+        // 6. Read head_dim and rope_theta from GGUF metadata for VL text config
+        let arch = gguf_file
+            .metadata
+            .get("general.architecture")
+            .and_then(|v| v.as_str())
+            .unwrap_or("qwen3vl")
+            .to_string();
+        let head_dim = gguf_file
+            .metadata
+            .get(&format!("{}.attention.key_length", arch))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(64) as usize;
+        let rope_theta = gguf_file
+            .metadata
+            .get(&format!("{}.rope.freq_base", arch))
+            .and_then(|v| v.as_f64())
+            .unwrap_or(5_000_000.0);
+
+        // Try to read mrope_section from GGUF metadata
+        let mrope_section = gguf_file
+            .metadata
+            .get(&format!("{}.rope.dimension_sections", arch))
+            .and_then(|v| {
+                if let gguf::MetadataValue::Array(arr) = v {
+                    let vals: Vec<usize> = arr
+                        .iter()
+                        .filter_map(|e| e.as_u64().map(|x| x as usize))
+                        .collect();
+                    if vals.len() >= 3 {
+                        Some(vals)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| {
+                // Compute from head_dim: for head_dim=64 -> [24, 20, 20]
+                // Total must equal head_dim. Section 0 is slightly larger.
+                let s2 = head_dim / 3; // 20 for 64, 21 for 64
+                let s0 = head_dim - 2 * s2;
+                vec![s0, s2, s2]
+            });
+
+        let tc = Qwen3VLTextConfig {
+            hidden_size: text_config_raw.hidden_size,
+            num_hidden_layers: text_config_raw.num_hidden_layers,
+            num_attention_heads: text_config_raw.num_attention_heads,
+            num_key_value_heads: text_config_raw.num_key_value_heads,
+            intermediate_size: text_config_raw.intermediate_size,
+            vocab_size: text_config_raw.vocab_size,
+            rms_norm_eps: text_config_raw.rms_norm_eps,
+            head_dim,
+            tie_word_embeddings: text_config_raw.tie_word_embeddings,
+            rope_theta,
+            mrope_section: Some(mrope_section.clone()),
+        };
+
+        let config = Qwen3VLConfig {
+            text_config: tc,
+            vision_config: vision_config.clone(),
+            image_token_id: 151655,
+            video_token_id: 151656,
+            vision_start_token_id: 151652,
+            vision_end_token_id: 151653,
+        };
+
+        // 7. Create text transformer skeleton
+        let transformer = Transformer::new(
+            config.text_config.vocab_size,
+            config.text_config.hidden_size,
+            config.text_config.num_hidden_layers,
+            config.text_config.num_attention_heads,
+            config.text_config.num_key_value_heads,
+            config.text_config.head_dim,
+            config.text_config.intermediate_size,
+            config.text_config.rms_norm_eps,
+            config.text_config.tie_word_embeddings,
+            None, // no MoE in VL models
+            device,
+        );
+
+        // 8. Resolve quantization
+        let detected = detect_gguf_quantization(&gguf_file);
+        let resolved_quant = match quantization {
+            QuantizationMode::Auto => detected,
+            other => other,
+        };
+
+        let quant_scheme = {
+            use burn::tensor::quantization::{QuantLevel, QuantScheme, QuantValue};
+            match resolved_quant {
+                QuantizationMode::Auto | QuantizationMode::None => None,
+                QuantizationMode::Int8 => {
+                    eprintln!("Loading GGUF with per-tensor INT8 quantization...");
+                    Some(
+                        QuantScheme::default()
+                            .with_value(QuantValue::Q8S)
+                            .with_level(QuantLevel::block([32])),
+                    )
+                }
+                QuantizationMode::Int4 => {
+                    eprintln!("Loading GGUF with per-tensor INT4 quantization...");
+                    Some(
+                        QuantScheme::default()
+                            .with_value(QuantValue::Q4S)
+                            .with_level(QuantLevel::block([32])),
+                    )
+                }
+            }
+        };
+
+        // 9. Load text weights
+        let per_tensor_quantized = quant_scheme.is_some();
+        let transformer = load_gguf_weights(
+            transformer,
+            &gguf_file,
+            &mut file,
+            &text_config_raw,
+            quant_scheme,
+            device,
+        )?;
+
+        let transformer = if per_tensor_quantized {
+            transformer
+        } else {
+            apply_quantization(transformer, resolved_quant)
+        };
+
+        // 10. Create vision encoder skeleton and load weights
+        let vision_encoder = VisionEncoder::new(&vision_config, device);
+        let vision_encoder =
+            load_gguf_vision_weights(vision_encoder, &mmproj_gguf, &mut mmproj_file, device)?;
+
+        // 11. Build mRoPE
+        let mrope = MRopeEmbedding::new(
+            [mrope_section[0], mrope_section[1], mrope_section[2]],
+            rope_theta,
+            head_dim,
+            device,
+        );
+
+        // 12. Create KV caches
+        let caches = (0..config.text_config.num_hidden_layers)
+            .map(|_| {
+                AttentionKvCache::new(
+                    1,
+                    config.text_config.num_key_value_heads,
+                    max_seq_len,
+                    config.text_config.head_dim,
+                    device,
+                )
             })
             .collect();
 
@@ -591,6 +819,280 @@ fn sample_token<B: Backend>(logits: &Tensor<B, 2>, temperature: f64, sampler: &m
     let probs: Vec<f64> = exp.iter().map(|&x| x / sum).collect();
 
     sampler.sample_probs(&probs)
+}
+
+/// Find an mmproj GGUF file in the given directory.
+///
+/// Scans for files matching `mmproj-*.gguf` or `*mmproj*.gguf`.
+fn find_mmproj_gguf(dir: &Path) -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+    let mut candidates = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+            if name.ends_with(".gguf") && name.contains("mmproj") {
+                candidates.push(path);
+            }
+        }
+    }
+    candidates.sort();
+    candidates
+        .into_iter()
+        .next()
+        .ok_or_else(|| format!("No mmproj-*.gguf file found in {}", dir.display()).into())
+}
+
+/// Load vision encoder weights from an mmproj GGUF file.
+///
+/// All vision weights are loaded as f32 (no quantization). The GGUF parser
+/// dequantizes F16/Q8_0 to f32 automatically. 2D weights (linear layers)
+/// are transposed from `[out, in]` to `[in, out]`.
+fn load_gguf_vision_weights<B: Backend>(
+    mut vision_encoder: VisionEncoder<B>,
+    gguf_file: &gguf::GgufFile,
+    file: &mut std::fs::File,
+    device: &Device<B>,
+) -> Result<VisionEncoder<B>, Box<dyn std::error::Error>> {
+    // Helper: read a tensor, return f32 data with reversed dims (PyTorch convention)
+    let read_tensor = |file: &mut std::fs::File,
+                       name: &str|
+     -> Result<(Vec<f32>, Vec<usize>), Box<dyn std::error::Error>> {
+        let info = gguf_file
+            .tensors
+            .get(name)
+            .ok_or_else(|| format!("mmproj tensor '{}' not found", name))?;
+        let data = gguf_file.read_tensor_data(file, info)?;
+        let shape: Vec<usize> = info.dims.iter().rev().copied().collect();
+        Ok((data, shape))
+    };
+
+    let make_1d = |data: Vec<f32>, device: &Device<B>| -> Tensor<B, 1> {
+        let len = data.len();
+        Tensor::from_data(TensorData::new(data, [len]), device)
+    };
+
+    let make_2d = |data: Vec<f32>, shape: &[usize], device: &Device<B>| -> Tensor<B, 2> {
+        Tensor::from_data(TensorData::new(data, [shape[0], shape[1]]), device)
+    };
+
+    // 2D linear weight: transpose [out, in] -> [in, out]
+    let make_2d_linear = |data: Vec<f32>, shape: &[usize], device: &Device<B>| -> Tensor<B, 2> {
+        let t = Tensor::from_data(TensorData::new(data, [shape[0], shape[1]]), device);
+        t.transpose()
+    };
+
+    // Track which tensors we've consumed for warning about unrecognized ones
+    let mut consumed = std::collections::HashSet::new();
+
+    // --- Patch embedding ---
+    // GGUF splits the Conv3D temporal dimension into separate tensors:
+    //   v.patch_embd.weight   → temporal slice 0: [out_ch, in_ch, patch_h, patch_w]
+    //   v.patch_embd.weight.1 → temporal slice 1: [out_ch, in_ch, patch_h, patch_w]
+    // We need to concatenate along the spatial dim to reconstruct
+    // [out_ch, in_ch * temporal * patch_h * patch_w].
+    if gguf_file.tensors.contains_key("v.patch_embd.weight") {
+        let (data0, shape0) = read_tensor(file, "v.patch_embd.weight")?;
+        consumed.insert("v.patch_embd.weight".to_string());
+        let out_dim = shape0[0];
+        let slice_dim: usize = shape0[1..].iter().product();
+
+        let weight = if gguf_file.tensors.contains_key("v.patch_embd.weight.1") {
+            let (data1, _) = read_tensor(file, "v.patch_embd.weight.1")?;
+            consumed.insert("v.patch_embd.weight.1".to_string());
+            // Concatenate: each slice is [out_dim, slice_dim], result is [out_dim, 2*slice_dim]
+            let mut combined = Vec::with_capacity(data0.len() + data1.len());
+            // Interleave rows: for each output channel, concat slice0 row then slice1 row
+            for row in 0..out_dim {
+                let start = row * slice_dim;
+                combined.extend_from_slice(&data0[start..start + slice_dim]);
+                combined.extend_from_slice(&data1[start..start + slice_dim]);
+            }
+            let total_dim = 2 * slice_dim;
+            Tensor::<B, 1>::from_data(TensorData::new(combined, [out_dim * total_dim]), device)
+                .reshape([out_dim, total_dim])
+        } else {
+            Tensor::<B, 1>::from_data(TensorData::new(data0, [out_dim * slice_dim]), device)
+                .reshape([out_dim, slice_dim])
+        };
+
+        let (bias_data, _) = read_tensor(file, "v.patch_embd.bias")?;
+        consumed.insert("v.patch_embd.bias".to_string());
+        let bias = make_1d(bias_data, device);
+        vision_encoder = vision_encoder.load_patch_embed(weight, bias);
+    }
+
+    // --- Position embeddings ---
+    if gguf_file.tensors.contains_key("v.position_embd.weight") {
+        let (data, shape) = read_tensor(file, "v.position_embd.weight")?;
+        consumed.insert("v.position_embd.weight".to_string());
+        let pos_weight = make_2d(data, &shape, device);
+        vision_encoder = vision_encoder.load_pos_embed(pos_weight);
+    }
+
+    // --- Vision blocks ---
+    let depth = vision_encoder.blocks.len();
+    for i in 0..depth {
+        let prefix = format!("v.blk.{}", i);
+
+        // Check if this block exists in the GGUF
+        let ln1_w_key = format!("{}.ln1.weight", prefix);
+        if !gguf_file.tensors.contains_key(&ln1_w_key) {
+            continue;
+        }
+
+        let load_1d = |file: &mut std::fs::File,
+                       key: &str,
+                       consumed: &mut std::collections::HashSet<String>|
+         -> Result<Tensor<B, 1>, Box<dyn std::error::Error>> {
+            let (data, _) = read_tensor(file, key)?;
+            consumed.insert(key.to_string());
+            Ok(make_1d(data, device))
+        };
+
+        let load_2d_linear = |file: &mut std::fs::File,
+                              key: &str,
+                              consumed: &mut std::collections::HashSet<String>|
+         -> Result<Tensor<B, 2>, Box<dyn std::error::Error>> {
+            let (data, shape) = read_tensor(file, key)?;
+            consumed.insert(key.to_string());
+            Ok(make_2d_linear(data, &shape, device))
+        };
+
+        let norm1_w = load_1d(file, &format!("{}.ln1.weight", prefix), &mut consumed)?;
+        let norm1_b = load_1d(file, &format!("{}.ln1.bias", prefix), &mut consumed)?;
+        let norm2_w = load_1d(file, &format!("{}.ln2.weight", prefix), &mut consumed)?;
+        let norm2_b = load_1d(file, &format!("{}.ln2.bias", prefix), &mut consumed)?;
+        let qkv_w = load_2d_linear(file, &format!("{}.attn_qkv.weight", prefix), &mut consumed)?;
+        let qkv_b = load_1d(file, &format!("{}.attn_qkv.bias", prefix), &mut consumed)?;
+        let proj_w = load_2d_linear(file, &format!("{}.attn_out.weight", prefix), &mut consumed)?;
+        let proj_b = load_1d(file, &format!("{}.attn_out.bias", prefix), &mut consumed)?;
+        let fc1_w = load_2d_linear(file, &format!("{}.ffn_up.weight", prefix), &mut consumed)?;
+        let fc1_b = load_1d(file, &format!("{}.ffn_up.bias", prefix), &mut consumed)?;
+        let fc2_w = load_2d_linear(file, &format!("{}.ffn_down.weight", prefix), &mut consumed)?;
+        let fc2_b = load_1d(file, &format!("{}.ffn_down.bias", prefix), &mut consumed)?;
+
+        vision_encoder.load_block(
+            i, norm1_w, norm1_b, norm2_w, norm2_b, qkv_w, qkv_b, proj_w, proj_b, fc1_w, fc1_b,
+            fc2_w, fc2_b,
+        );
+
+        if i % 10 == 0 {
+            eprintln!("Loading vision block {}/{}...", i, depth);
+        }
+    }
+
+    // --- Main merger ---
+    // Try mm.post_norm (standard) or v.post_ln (variant)
+    let norm_key = if gguf_file.tensors.contains_key("mm.post_norm.weight") {
+        "mm.post_norm"
+    } else if gguf_file.tensors.contains_key("v.post_ln.weight") {
+        "v.post_ln"
+    } else {
+        return Err("No merger norm found (tried mm.post_norm, v.post_ln)".into());
+    };
+
+    let (norm_w_data, _) = read_tensor(file, &format!("{}.weight", norm_key))?;
+    consumed.insert(format!("{}.weight", norm_key));
+    let norm_w = make_1d(norm_w_data, device);
+    let (norm_b_data, _) = read_tensor(file, &format!("{}.bias", norm_key))?;
+    consumed.insert(format!("{}.bias", norm_key));
+    let norm_b = make_1d(norm_b_data, device);
+
+    // FC layers: try mm.0/mm.1 (standard) or mm.0/mm.2 (variant)
+    let fc1_key = "mm.0";
+    let fc2_key = if gguf_file.tensors.contains_key("mm.1.weight") {
+        "mm.1"
+    } else if gguf_file.tensors.contains_key("mm.2.weight") {
+        "mm.2"
+    } else {
+        return Err("No merger fc2 found (tried mm.1, mm.2)".into());
+    };
+
+    let (fc1_w_data, fc1_w_shape) = read_tensor(file, &format!("{}.weight", fc1_key))?;
+    consumed.insert(format!("{}.weight", fc1_key));
+    let fc1_w = make_2d_linear(fc1_w_data, &fc1_w_shape, device);
+    let (fc1_b_data, _) = read_tensor(file, &format!("{}.bias", fc1_key))?;
+    consumed.insert(format!("{}.bias", fc1_key));
+    let fc1_b = make_1d(fc1_b_data, device);
+
+    let (fc2_w_data, fc2_w_shape) = read_tensor(file, &format!("{}.weight", fc2_key))?;
+    consumed.insert(format!("{}.weight", fc2_key));
+    let fc2_w = make_2d_linear(fc2_w_data, &fc2_w_shape, device);
+    let (fc2_b_data, _) = read_tensor(file, &format!("{}.bias", fc2_key))?;
+    consumed.insert(format!("{}.bias", fc2_key));
+    let fc2_b = make_1d(fc2_b_data, device);
+
+    vision_encoder.load_merger(norm_w, norm_b, fc1_w, fc1_b, fc2_w, fc2_b);
+
+    // --- Deepstack mergers ---
+    // GGUF uses actual layer indices as keys (e.g., v.deepstack.5, v.deepstack.11, v.deepstack.17),
+    // while VisionEncoder uses sequential merger indices (0, 1, 2).
+    // Collect and sort the actual layer indices from tensor names.
+    let mut ds_layer_indices: Vec<usize> = Vec::new();
+    for name in gguf_file.tensors.keys() {
+        if let Some(rest) = name.strip_prefix("v.deepstack.") {
+            if let Some(dot_pos) = rest.find('.') {
+                if let Ok(idx) = rest[..dot_pos].parse::<usize>() {
+                    if !ds_layer_indices.contains(&idx) {
+                        ds_layer_indices.push(idx);
+                    }
+                }
+            }
+        }
+    }
+    ds_layer_indices.sort();
+
+    for (merger_idx, &layer_idx) in ds_layer_indices.iter().enumerate() {
+        let ds_prefix = format!("v.deepstack.{}", layer_idx);
+
+        let (ds_norm_w_data, _) = read_tensor(file, &format!("{}.norm.weight", ds_prefix))?;
+        consumed.insert(format!("{}.norm.weight", ds_prefix));
+        let ds_norm_w = make_1d(ds_norm_w_data, device);
+        let (ds_norm_b_data, _) = read_tensor(file, &format!("{}.norm.bias", ds_prefix))?;
+        consumed.insert(format!("{}.norm.bias", ds_prefix));
+        let ds_norm_b = make_1d(ds_norm_b_data, device);
+
+        let (ds_fc1_w_data, ds_fc1_w_shape) =
+            read_tensor(file, &format!("{}.fc1.weight", ds_prefix))?;
+        consumed.insert(format!("{}.fc1.weight", ds_prefix));
+        let ds_fc1_w = make_2d_linear(ds_fc1_w_data, &ds_fc1_w_shape, device);
+        let (ds_fc1_b_data, _) = read_tensor(file, &format!("{}.fc1.bias", ds_prefix))?;
+        consumed.insert(format!("{}.fc1.bias", ds_prefix));
+        let ds_fc1_b = make_1d(ds_fc1_b_data, device);
+
+        let (ds_fc2_w_data, ds_fc2_w_shape) =
+            read_tensor(file, &format!("{}.fc2.weight", ds_prefix))?;
+        consumed.insert(format!("{}.fc2.weight", ds_prefix));
+        let ds_fc2_w = make_2d_linear(ds_fc2_w_data, &ds_fc2_w_shape, device);
+        let (ds_fc2_b_data, _) = read_tensor(file, &format!("{}.fc2.bias", ds_prefix))?;
+        consumed.insert(format!("{}.fc2.bias", ds_prefix));
+        let ds_fc2_b = make_1d(ds_fc2_b_data, device);
+
+        vision_encoder.load_deepstack_merger(
+            merger_idx, ds_norm_w, ds_norm_b, ds_fc1_w, ds_fc1_b, ds_fc2_w, ds_fc2_b,
+        );
+    }
+
+    // Log unrecognized tensors
+    let unrecognized: Vec<&String> = gguf_file
+        .tensors
+        .keys()
+        .filter(|k| !consumed.contains(*k))
+        .collect();
+    if !unrecognized.is_empty() {
+        eprintln!("Warning: {} mmproj tensors not loaded:", unrecognized.len());
+        let mut sorted: Vec<&&String> = unrecognized.iter().collect();
+        sorted.sort();
+        for k in sorted.iter().take(20) {
+            eprintln!("  - {}", k);
+        }
+        if sorted.len() > 20 {
+            eprintln!("  ... and {} more", sorted.len() - 20);
+        }
+    }
+
+    eprintln!("Vision encoder loaded successfully.");
+    Ok(vision_encoder)
 }
 
 type TensorMap = HashMap<String, (Vec<f32>, Vec<usize>)>;

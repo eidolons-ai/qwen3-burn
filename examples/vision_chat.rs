@@ -8,6 +8,7 @@ use qwen3_burn::model::GenerationEvent;
 use qwen3_burn::sampling::Sampler;
 use qwen3_burn::tokenizer::Qwen3Tokenizer;
 use qwen3_burn::vision_model::{Qwen3VL, VLGenerationParams, VisionInput};
+use qwen3_burn::QuantizationMode;
 
 const DEFAULT_PROMPT: &str = "Describe this image in detail.";
 
@@ -17,7 +18,7 @@ const DEFAULT_PROMPT: &str = "Describe this image in detail.";
     about = "Qwen3-VL vision-language chat example"
 )]
 struct Args {
-    /// Path to the model directory (SafeTensors)
+    /// Path to the model directory (SafeTensors) or .gguf file
     #[arg(short, long)]
     model_path: String,
 
@@ -49,24 +50,69 @@ struct Args {
     #[arg(long, default_value_t = 4096)]
     max_seq_len: usize,
 
+    /// Weight quantization: auto, none, int8, int4
+    #[arg(long, default_value = "auto")]
+    quantize: String,
+
+    /// Model format: auto, safetensors, gguf
+    #[arg(long, default_value = "auto")]
+    format: String,
+
     /// Random seed
     #[arg(long, default_value_t = 42)]
     seed: u64,
 }
 
+fn parse_quantization(s: &str) -> QuantizationMode {
+    match s {
+        "auto" => QuantizationMode::Auto,
+        "none" => QuantizationMode::None,
+        "int8" => QuantizationMode::Int8,
+        "int4" => QuantizationMode::Int4,
+        other => {
+            eprintln!("Unknown quantization mode '{}', using auto", other);
+            QuantizationMode::Auto
+        }
+    }
+}
+
 fn run<B: burn::prelude::Backend>(args: Args, device: burn::prelude::Device<B>) {
     let model_path = std::path::Path::new(&args.model_path);
 
-    // Load tokenizer
-    let tokenizer_path = model_path.join("tokenizer.json");
+    // Determine format: auto-detect from file extension
+    let use_gguf = match args.format.as_str() {
+        "gguf" => true,
+        "safetensors" => false,
+        _ => {
+            // Auto-detect: if path ends in .gguf, use GGUF format
+            model_path.extension().is_some_and(|ext| ext == "gguf")
+        }
+    };
+
+    // Find tokenizer.json: next to the .gguf file or in the model directory
+    let tokenizer_path = if use_gguf {
+        model_path
+            .parent()
+            .unwrap_or(std::path::Path::new("."))
+            .join("tokenizer.json")
+    } else {
+        model_path.join("tokenizer.json")
+    };
+
     eprintln!("Loading tokenizer...");
     let tokenizer = Qwen3Tokenizer::new(&tokenizer_path).expect("Failed to load tokenizer");
 
     // Load model
+    let quantization = parse_quantization(&args.quantize);
     eprintln!("Loading Qwen3-VL model from {}...", args.model_path);
     let load_start = Instant::now();
-    let mut model = Qwen3VL::<B>::from_pretrained(&args.model_path, args.max_seq_len, &device)
-        .expect("Failed to load model");
+    let mut model = if use_gguf {
+        Qwen3VL::<B>::from_gguf(&args.model_path, args.max_seq_len, quantization, &device)
+            .expect("Failed to load GGUF model")
+    } else {
+        Qwen3VL::<B>::from_pretrained(&args.model_path, args.max_seq_len, &device)
+            .expect("Failed to load model")
+    };
     eprintln!("Model loaded in {:.1}s", load_start.elapsed().as_secs_f64());
 
     // Preprocess images
