@@ -145,8 +145,8 @@ fn build_dim_assignment(mrope_section: &[usize; 3], half_dim: usize) -> Vec<usiz
 /// Build 3D position IDs for a mixed text+vision sequence.
 ///
 /// - `token_ids`: the full token sequence
-/// - `image_token_id`: the placeholder token for image patches
-/// - `grid_thws`: `[(t, h, w)]` for each image in the sequence
+/// - `vision_token_ids`: placeholder tokens for vision patches (e.g. `[image_token_id, video_token_id]`)
+/// - `grid_thws`: `[(t, h, w)]` for each vision input in the sequence
 ///
 /// Returns `[3, seq_len]` position IDs (T, H, W).
 ///
@@ -154,7 +154,7 @@ fn build_dim_assignment(mrope_section: &[usize; 3], half_dim: usize) -> Vec<usiz
 /// Vision tokens get 3D positions based on their temporal/height/width position in the grid.
 pub fn build_position_ids(
     token_ids: &[u32],
-    image_token_id: u32,
+    vision_token_ids: &[u32],
     grid_thws: &[(usize, usize, usize)],
 ) -> Vec<Vec<usize>> {
     let seq_len = token_ids.len();
@@ -167,7 +167,7 @@ pub fn build_position_ids(
     let mut i = 0;
 
     while i < seq_len {
-        if token_ids[i] == image_token_id && image_idx < grid_thws.len() {
+        if vision_token_ids.contains(&token_ids[i]) && image_idx < grid_thws.len() {
             let (grid_t, grid_h, grid_w) = grid_thws[image_idx];
             let num_vision_tokens = grid_t * grid_h * grid_w;
 
@@ -175,7 +175,7 @@ pub fn build_position_ids(
             for vt in 0..grid_t {
                 for vh in 0..grid_h {
                     for vw in 0..grid_w {
-                        if i < seq_len && token_ids[i] == image_token_id {
+                        if i < seq_len && vision_token_ids.contains(&token_ids[i]) {
                             t_pos[i] = text_position + vt;
                             h_pos[i] = text_position + vh;
                             w_pos[i] = text_position + vw;
@@ -233,8 +233,7 @@ mod tests {
     #[test]
     fn text_only_positions_identical() {
         let token_ids = vec![1, 2, 3, 4, 5];
-        let image_token_id = 99999; // not present
-        let positions = build_position_ids(&token_ids, image_token_id, &[]);
+        let positions = build_position_ids(&token_ids, &[99999], &[]);
 
         assert_eq!(positions.len(), 3);
         assert_eq!(positions[0].len(), 5);
@@ -251,11 +250,10 @@ mod tests {
     fn vision_tokens_have_3d_positions() {
         // Sequence: [text, text, img, img, img, img, text]
         // where img tokens represent a 1x2x2 grid (T=1, H=2, W=2)
-        let image_token_id = 100;
         let token_ids = vec![1, 2, 100, 100, 100, 100, 3];
         let grid_thws = vec![(1, 2, 2)];
 
-        let positions = build_position_ids(&token_ids, image_token_id, &grid_thws);
+        let positions = build_position_ids(&token_ids, &[100], &grid_thws);
 
         // First two text tokens: positions 0, 1
         assert_eq!(positions[0][0], 0);
@@ -285,6 +283,41 @@ mod tests {
         assert_eq!(positions[0][6], 4);
         assert_eq!(positions[1][6], 4);
         assert_eq!(positions[2][6], 4);
+    }
+
+    #[test]
+    fn mixed_image_and_video_tokens() {
+        // Sequence: [text, img, img, img, img, text, vid, vid, vid, vid, vid, vid, vid, vid, text]
+        // img: 1x2x2 grid, vid: 2x2x2 grid (T=2)
+        let image_token_id = 100;
+        let video_token_id = 200;
+        let token_ids = vec![
+            1, 100, 100, 100, 100, 2, 200, 200, 200, 200, 200, 200, 200, 200, 3,
+        ];
+        let grid_thws = vec![(1, 2, 2), (2, 2, 2)];
+
+        let positions =
+            build_position_ids(&token_ids, &[image_token_id, video_token_id], &grid_thws);
+
+        // Text token 0: pos 0
+        assert_eq!(positions[0][0], 0);
+
+        // Image tokens 1-4: 1x2x2, text_position starts at 1
+        assert_eq!(positions[0][1], 1); // vt=0
+        assert_eq!(positions[1][1], 1); // vh=0
+        assert_eq!(positions[2][1], 1); // vw=0
+
+        // After image: max_dim=2, text_position = 1+2 = 3
+        // Text token 5: pos 3
+        assert_eq!(positions[0][5], 3);
+
+        // Video tokens 6-13: 2x2x2, text_position starts at 4
+        // First temporal slice (vt=0): tokens 6,7,8,9
+        assert_eq!(positions[0][6], 4); // vt=0
+        assert_eq!(positions[0][10], 5); // vt=1
+
+        // After video: max_dim=2, text_position = 4+2 = 6
+        assert_eq!(positions[0][14], 6);
     }
 
     #[test]

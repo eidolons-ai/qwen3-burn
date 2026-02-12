@@ -25,6 +25,12 @@ pub struct ImageProcessor {
     pub min_pixels: usize,
     /// Maximum total pixels after resize (default: 1003520 = 1280*784).
     pub max_pixels: usize,
+    /// Target sampling rate for video in frames per second (default: 2.0).
+    pub video_fps: f32,
+    /// Minimum number of frames to extract from video (default: 4).
+    pub video_min_frames: usize,
+    /// Maximum number of frames to extract from video (default: 128).
+    pub video_max_frames: usize,
 }
 
 impl Default for ImageProcessor {
@@ -36,6 +42,9 @@ impl Default for ImageProcessor {
             in_channels: 3,
             min_pixels: 3136,
             max_pixels: 1003520,
+            video_fps: 2.0,
+            video_min_frames: 4,
+            video_max_frames: 128,
         }
     }
 }
@@ -81,7 +90,7 @@ impl ImageProcessor {
             self.in_channels * self.temporal_patch_size * self.patch_size * self.patch_size;
         let grid_h = new_h / self.patch_size;
         let grid_w = new_w / self.patch_size;
-        let grid_t = self.temporal_patch_size / self.temporal_patch_size; // = 1
+        let grid_t = 1; // single image = 1 temporal group
 
         let patches = self.extract_patches(&frames, new_h, new_w);
         let num_patches = grid_t * grid_h * grid_w;
@@ -135,7 +144,7 @@ impl ImageProcessor {
         }
 
         // Pad to even count
-        if frame_pixels.len() % self.temporal_patch_size != 0 {
+        if !frame_pixels.len().is_multiple_of(self.temporal_patch_size) {
             let last = frame_pixels.last().unwrap().clone();
             frame_pixels.push(last);
         }
@@ -158,6 +167,111 @@ impl ImageProcessor {
             num_patches,
             patch_embed_dim,
         })
+    }
+
+    /// Compute the number of frames to extract from a video of the given duration.
+    ///
+    /// Frames = `(duration * video_fps).round()`, clamped to `[video_min_frames, video_max_frames]`,
+    /// then rounded up to the nearest multiple of `temporal_patch_size` (2).
+    pub fn compute_video_frame_count(&self, duration_secs: f64) -> usize {
+        let raw = (duration_secs * self.video_fps as f64).round() as usize;
+        let clamped = raw.clamp(self.video_min_frames, self.video_max_frames);
+        // Round up to nearest multiple of temporal_patch_size
+        let tps = self.temporal_patch_size;
+        clamped.div_ceil(tps) * tps
+    }
+
+    /// Preprocess a video file for the vision encoder.
+    ///
+    /// Uses `ffprobe` to get the video duration, then `ffmpeg` to extract frames
+    /// at a computed FPS. Requires `ffmpeg` and `ffprobe` on PATH.
+    ///
+    /// Returns an `ImageInput` with the preprocessed video frames.
+    pub fn preprocess_video(&self, path: &std::path::Path) -> Result<ImageInput, String> {
+        use std::process::Command;
+
+        // 1. Get video duration via ffprobe
+        let ffprobe_output = Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+            ])
+            .arg(path)
+            .output()
+            .map_err(|e| format!("Failed to run ffprobe (is it installed?): {}", e))?;
+
+        if !ffprobe_output.status.success() {
+            let stderr = String::from_utf8_lossy(&ffprobe_output.stderr);
+            return Err(format!("ffprobe failed: {}", stderr));
+        }
+
+        let duration_str = String::from_utf8_lossy(&ffprobe_output.stdout)
+            .trim()
+            .to_string();
+        let duration_secs: f64 = duration_str
+            .parse()
+            .map_err(|e| format!("Failed to parse duration '{}': {}", duration_str, e))?;
+        eprintln!("Video duration: {:.2}s", duration_secs);
+
+        // 2. Compute frame count
+        let num_frames = self.compute_video_frame_count(duration_secs);
+        eprintln!("Extracting {} frames...", num_frames);
+
+        // 3. Create temp directory for extracted frames
+        let tmp_dir = std::env::temp_dir().join(format!("qwen3vl_video_{}", std::process::id()));
+        std::fs::create_dir_all(&tmp_dir)
+            .map_err(|e| format!("Failed to create temp dir: {}", e))?;
+
+        // 4. Extract frames via ffmpeg
+        let effective_fps = num_frames as f64 / duration_secs;
+        let output_pattern = tmp_dir.join("frame_%05d.png");
+        let ffmpeg_status = Command::new("ffmpeg")
+            .args(["-i"])
+            .arg(path)
+            .args([
+                "-vf",
+                &format!("fps={}", effective_fps),
+                "-frames:v",
+                &num_frames.to_string(),
+            ])
+            .arg(&output_pattern)
+            .args(["-loglevel", "error", "-y"])
+            .status()
+            .map_err(|e| format!("Failed to run ffmpeg (is it installed?): {}", e))?;
+
+        if !ffmpeg_status.success() {
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+            return Err("ffmpeg frame extraction failed".to_string());
+        }
+
+        // 5. Collect extracted frame paths (sorted)
+        let mut frame_paths: Vec<std::path::PathBuf> = std::fs::read_dir(&tmp_dir)
+            .map_err(|e| format!("Failed to read temp dir: {}", e))?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|ext| ext == "png"))
+            .collect();
+        frame_paths.sort();
+
+        if frame_paths.is_empty() {
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+            return Err("ffmpeg extracted 0 frames".to_string());
+        }
+
+        eprintln!("Extracted {} frames", frame_paths.len());
+
+        // 6. Process via existing preprocess_video_frames
+        let path_refs: Vec<&std::path::Path> = frame_paths.iter().map(|p| p.as_path()).collect();
+        let result = self.preprocess_video_frames(&path_refs);
+
+        // 7. Clean up temp directory
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+
+        result
     }
 
     /// Compute resize dimensions maintaining aspect ratio, divisible by spatial_unit,
@@ -295,6 +409,34 @@ mod tests {
         // num_patches = 1 * 2 * 2 = 4
         // patch_embed_dim = 3 * 2 * 16 * 16 = 1536
         assert_eq!(patches.len(), 4 * 1536);
+    }
+
+    #[test]
+    fn video_frame_count_basic() {
+        let proc = ImageProcessor::default();
+        // 10s at 2fps = 20 frames, already even
+        assert_eq!(proc.compute_video_frame_count(10.0), 20);
+    }
+
+    #[test]
+    fn video_frame_count_rounds_to_temporal_patch() {
+        let proc = ImageProcessor::default();
+        // 2.5s at 2fps = 5 frames, rounded to 5, then ceil to 6 (next multiple of 2)
+        assert_eq!(proc.compute_video_frame_count(2.5), 6);
+    }
+
+    #[test]
+    fn video_frame_count_clamps_min() {
+        let proc = ImageProcessor::default();
+        // 0.5s at 2fps = 1 frame, clamped to min 4
+        assert_eq!(proc.compute_video_frame_count(0.5), 4);
+    }
+
+    #[test]
+    fn video_frame_count_clamps_max() {
+        let proc = ImageProcessor::default();
+        // 1000s at 2fps = 2000 frames, clamped to max 128
+        assert_eq!(proc.compute_video_frame_count(1000.0), 128);
     }
 
     #[test]
