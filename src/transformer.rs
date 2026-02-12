@@ -1118,22 +1118,22 @@ impl<B: Backend> Transformer<B> {
 
 /// Build a causal attention mask of shape `[seq_len, total_seq_len]`.
 /// Positions that should not be attended to get `f32::NEG_INFINITY`.
+/// Constructed on-device using tensor ops to avoid CPU→GPU transfer of O(N²) mask data.
 pub fn build_causal_mask<B: Backend>(
     seq_len: usize,
     total_seq_len: usize,
     device: &Device<B>,
 ) -> Tensor<B, 2> {
-    // Create upper triangular mask: mask[i][j] = -inf if j > i + offset
-    let offset = total_seq_len - seq_len;
-    let mut mask_data = vec![0.0f32; seq_len * total_seq_len];
-    for i in 0..seq_len {
-        for j in 0..total_seq_len {
-            if j > i + offset {
-                mask_data[i * total_seq_len + j] = f32::NEG_INFINITY;
-            }
-        }
-    }
-    Tensor::<B, 1>::from_floats(&mask_data[..], device).reshape([seq_len, total_seq_len])
+    let offset = (total_seq_len - seq_len) as i64;
+    // Row indices [0..seq_len] → [seq_len, 1] for broadcasting
+    let rows = Tensor::<B, 1, Int>::arange(0..seq_len as i64, device).reshape([seq_len, 1]);
+    // Col indices [0..total_seq_len] → [1, total_seq_len] for broadcasting
+    let cols =
+        Tensor::<B, 1, Int>::arange(0..total_seq_len as i64, device).reshape([1, total_seq_len]);
+    // mask_bool[i][j] = true where j > i + offset (future positions to mask)
+    let mask_bool = cols.greater(rows + offset);
+    // 0.0 for attendable positions, -inf for masked positions
+    Tensor::<B, 2>::zeros([seq_len, total_seq_len], device).mask_fill(mask_bool, f32::NEG_INFINITY)
 }
 
 #[cfg(test)]
