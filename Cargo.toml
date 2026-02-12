@@ -11,6 +11,7 @@ std = []
 wgpu = ["burn/wgpu"]
 ndarray = ["burn/ndarray"]
 cuda = ["burn/cuda"]
+mlx = ["burn-mlx"]
 bench = []
 profile = ["tracing-subscriber"]
 vision = ["image"]
@@ -28,6 +29,7 @@ rand = "0.9"
 half = { version = "2.4", features = ["serde"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", optional = true }
+burn-mlx = { git = "https://github.com/eidolons-ai/burn-mlx.git", branch = "burn-0-20", optional = true }
 image = { version = "0.25", optional = true, default-features = false, features = ["png", "jpeg"] }
 
 [dev-dependencies]

@@ -225,9 +225,21 @@ fn main() {
         run::<Cuda<f16, i32>>(args, device);
     }
 
-    #[cfg(not(any(feature = "wgpu", feature = "ndarray", feature = "cuda")))]
+    #[cfg(feature = "mlx")]
     {
-        eprintln!("No backend feature enabled. Use --features wgpu, ndarray, or cuda.");
+        use burn_mlx::{Mlx, MlxDevice};
+        let device = MlxDevice::Gpu;
+        run::<Mlx>(args, device);
+    }
+
+    #[cfg(not(any(
+        feature = "wgpu",
+        feature = "ndarray",
+        feature = "cuda",
+        feature = "mlx"
+    )))]
+    {
+        eprintln!("No backend feature enabled. Use --features wgpu, ndarray, cuda, or mlx.");
         std::process::exit(1);
     }
 }
