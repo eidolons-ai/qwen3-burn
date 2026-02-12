@@ -140,9 +140,7 @@ pub fn apply_rotary<B: Backend>(
 /// Multi-head attention with grouped-query attention and QK-Norm.
 #[derive(Module, Debug)]
 pub struct MultiHeadAttention<B: Backend> {
-    q_proj: nn::Linear<B>,
-    k_proj: nn::Linear<B>,
-    v_proj: nn::Linear<B>,
+    qkv_proj: nn::Linear<B>,
     o_proj: nn::Linear<B>,
     q_norm: RmsNorm<B>,
     k_norm: RmsNorm<B>,
@@ -190,13 +188,7 @@ impl<B: Backend> MultiHeadAttention<B> {
         let kv_dim = num_kv_heads * head_dim;
 
         Self {
-            q_proj: nn::LinearConfig::new(d_model, q_dim)
-                .with_bias(false)
-                .init(device),
-            k_proj: nn::LinearConfig::new(d_model, kv_dim)
-                .with_bias(false)
-                .init(device),
-            v_proj: nn::LinearConfig::new(d_model, kv_dim)
+            qkv_proj: nn::LinearConfig::new(d_model, q_dim + 2 * kv_dim)
                 .with_bias(false)
                 .init(device),
             o_proj: nn::LinearConfig::new(q_dim, d_model)
@@ -227,10 +219,15 @@ impl<B: Backend> MultiHeadAttention<B> {
     ) -> Tensor<B, 3> {
         let [batch, seq_len, _d_model] = x.dims();
 
-        // Project Q, K, V
-        let q = self.q_proj.forward(x.clone());
-        let k = self.k_proj.forward(x.clone());
-        let v = self.v_proj.forward(x);
+        // Fused QKV projection: single matmul → split
+        let qkv = self.qkv_proj.forward(x);
+        let q_dim = self.num_heads * self.head_dim;
+        let kv_dim = self.num_kv_heads * self.head_dim;
+        let q = qkv.clone().slice([0..batch, 0..seq_len, 0..q_dim]);
+        let k = qkv
+            .clone()
+            .slice([0..batch, 0..seq_len, q_dim..q_dim + kv_dim]);
+        let v = qkv.slice([0..batch, 0..seq_len, q_dim + kv_dim..q_dim + 2 * kv_dim]);
 
         // Reshape to [batch, seq_len, num_heads, head_dim]
         let q = q.reshape([batch, seq_len, self.num_heads, self.head_dim]);
@@ -302,9 +299,15 @@ impl<B: Backend> MultiHeadAttention<B> {
     ) -> Tensor<B, 3> {
         let [batch, seq_len, _d_model] = x.dims();
 
-        let q = self.q_proj.forward(x.clone());
-        let k = self.k_proj.forward(x.clone());
-        let v = self.v_proj.forward(x);
+        // Fused QKV projection: single matmul → split
+        let qkv = self.qkv_proj.forward(x);
+        let q_dim = self.num_heads * self.head_dim;
+        let kv_dim = self.num_kv_heads * self.head_dim;
+        let q = qkv.clone().slice([0..batch, 0..seq_len, 0..q_dim]);
+        let k = qkv
+            .clone()
+            .slice([0..batch, 0..seq_len, q_dim..q_dim + kv_dim]);
+        let v = qkv.slice([0..batch, 0..seq_len, q_dim + kv_dim..q_dim + 2 * kv_dim]);
 
         let q = q.reshape([batch, seq_len, self.num_heads, self.head_dim]);
         let k = k.reshape([batch, seq_len, self.num_kv_heads, self.head_dim]);
@@ -1025,9 +1028,7 @@ impl<B: Backend> Transformer<B> {
     pub fn load_layer(
         mut self,
         layer_idx: usize,
-        q_proj_w: Tensor<B, 2>,
-        k_proj_w: Tensor<B, 2>,
-        v_proj_w: Tensor<B, 2>,
+        qkv_proj_w: Tensor<B, 2>,
         o_proj_w: Tensor<B, 2>,
         q_norm_w: Tensor<B, 1>,
         k_norm_w: Tensor<B, 1>,
@@ -1038,10 +1039,8 @@ impl<B: Backend> Transformer<B> {
     ) -> Self {
         let layer = &mut self.layers[layer_idx];
 
-        // Attention projections
-        layer.self_attn.q_proj.weight = Param::from_tensor(q_proj_w);
-        layer.self_attn.k_proj.weight = Param::from_tensor(k_proj_w);
-        layer.self_attn.v_proj.weight = Param::from_tensor(v_proj_w);
+        // Attention projections (fused QKV)
+        layer.self_attn.qkv_proj.weight = Param::from_tensor(qkv_proj_w);
         layer.self_attn.o_proj.weight = Param::from_tensor(o_proj_w);
 
         // QK-Norm
@@ -1073,9 +1072,7 @@ impl<B: Backend> Transformer<B> {
     pub fn load_moe_layer(
         mut self,
         layer_idx: usize,
-        q_proj_w: Tensor<B, 2>,
-        k_proj_w: Tensor<B, 2>,
-        v_proj_w: Tensor<B, 2>,
+        qkv_proj_w: Tensor<B, 2>,
         o_proj_w: Tensor<B, 2>,
         q_norm_w: Tensor<B, 1>,
         k_norm_w: Tensor<B, 1>,
@@ -1087,10 +1084,8 @@ impl<B: Backend> Transformer<B> {
     ) -> Self {
         let layer = &mut self.layers[layer_idx];
 
-        // Attention projections
-        layer.self_attn.q_proj.weight = Param::from_tensor(q_proj_w);
-        layer.self_attn.k_proj.weight = Param::from_tensor(k_proj_w);
-        layer.self_attn.v_proj.weight = Param::from_tensor(v_proj_w);
+        // Attention projections (fused QKV)
+        layer.self_attn.qkv_proj.weight = Param::from_tensor(qkv_proj_w);
         layer.self_attn.o_proj.weight = Param::from_tensor(o_proj_w);
 
         // QK-Norm

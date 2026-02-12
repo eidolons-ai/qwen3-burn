@@ -1176,6 +1176,8 @@ fn load_vl_text_layer<B: Backend>(
     let q_proj_w = take_linear_weight(map, &format!("{}.self_attn.q_proj.weight", p), device)?;
     let k_proj_w = take_linear_weight(map, &format!("{}.self_attn.k_proj.weight", p), device)?;
     let v_proj_w = take_linear_weight(map, &format!("{}.self_attn.v_proj.weight", p), device)?;
+    // Fuse Q, K, V into single weight: each is [d_model, *_dim], cat along dim 1
+    let qkv_proj_w = Tensor::cat(vec![q_proj_w, k_proj_w, v_proj_w], 1);
     let o_proj_w = take_linear_weight(map, &format!("{}.self_attn.o_proj.weight", p), device)?;
     let q_norm_w = take_tensor_1d(map, &format!("{}.self_attn.q_norm.weight", p), device)?;
     let k_norm_w = take_tensor_1d(map, &format!("{}.self_attn.k_norm.weight", p), device)?;
@@ -1192,9 +1194,7 @@ fn load_vl_text_layer<B: Backend>(
 
     Ok(transformer.load_layer(
         layer_idx,
-        q_proj_w,
-        k_proj_w,
-        v_proj_w,
+        qkv_proj_w,
         o_proj_w,
         q_norm_w,
         k_norm_w,

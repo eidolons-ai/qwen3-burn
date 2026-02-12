@@ -898,6 +898,8 @@ fn load_layer_weights<B: Backend>(
     let q_proj_w = take_linear_weight(map, &format!("{}.self_attn.q_proj.weight", prefix), device)?;
     let k_proj_w = take_linear_weight(map, &format!("{}.self_attn.k_proj.weight", prefix), device)?;
     let v_proj_w = take_linear_weight(map, &format!("{}.self_attn.v_proj.weight", prefix), device)?;
+    // Fuse Q, K, V into single weight: each is [d_model, *_dim], cat along dim 1
+    let qkv_proj_w = Tensor::cat(vec![q_proj_w, k_proj_w, v_proj_w], 1);
     let o_proj_w = take_linear_weight(map, &format!("{}.self_attn.o_proj.weight", prefix), device)?;
     let q_norm_w = take_tensor_1d(map, &format!("{}.self_attn.q_norm.weight", prefix), device)?;
     let k_norm_w = take_tensor_1d(map, &format!("{}.self_attn.k_norm.weight", prefix), device)?;
@@ -944,9 +946,7 @@ fn load_layer_weights<B: Backend>(
 
         Ok(transformer.load_moe_layer(
             layer_idx,
-            q_proj_w,
-            k_proj_w,
-            v_proj_w,
+            qkv_proj_w,
             o_proj_w,
             q_norm_w,
             k_norm_w,
@@ -966,9 +966,7 @@ fn load_layer_weights<B: Backend>(
 
         Ok(transformer.load_layer(
             layer_idx,
-            q_proj_w,
-            k_proj_w,
-            v_proj_w,
+            qkv_proj_w,
             o_proj_w,
             q_norm_w,
             k_norm_w,
@@ -1315,16 +1313,15 @@ pub(crate) fn load_gguf_weights<B: Backend>(
             eprintln!("Loading layer {}/{}...", i, config.num_hidden_layers);
         }
 
-        // Attention projections — GGUF stores [out, in] (PyTorch convention after dim reversal),
-        // Burn needs [in, out], so transpose. When quantizing, this is done on CPU.
-        let (q_data, q_shape) = read_tensor(file, &format!("blk.{}.attn_q.weight", i))?;
-        let q_proj_w = make_2d_linear(q_data, &q_shape, device);
-
+        // Fuse Q, K, V at f32 level before transpose/quantization (same approach as gate+up).
+        // All are [out, hidden] after GGUF dim reversal; concatenate rows → [q_out+k_out+v_out, hidden].
+        let (mut qkv_data, q_shape) = read_tensor(file, &format!("blk.{}.attn_q.weight", i))?;
         let (k_data, k_shape) = read_tensor(file, &format!("blk.{}.attn_k.weight", i))?;
-        let k_proj_w = make_2d_linear(k_data, &k_shape, device);
-
         let (v_data, v_shape) = read_tensor(file, &format!("blk.{}.attn_v.weight", i))?;
-        let v_proj_w = make_2d_linear(v_data, &v_shape, device);
+        qkv_data.extend_from_slice(&k_data);
+        qkv_data.extend_from_slice(&v_data);
+        let qkv_shape = vec![q_shape[0] + k_shape[0] + v_shape[0], q_shape[1]];
+        let qkv_proj_w = make_2d_linear(qkv_data, &qkv_shape, device);
 
         let (o_data, o_shape) = read_tensor(file, &format!("blk.{}.attn_output.weight", i))?;
         let o_proj_w = make_2d_linear(o_data, &o_shape, device);
@@ -1370,9 +1367,7 @@ pub(crate) fn load_gguf_weights<B: Backend>(
 
             transformer = transformer.load_moe_layer(
                 i,
-                q_proj_w,
-                k_proj_w,
-                v_proj_w,
+                qkv_proj_w,
                 o_proj_w,
                 q_norm_w,
                 k_norm_w,
@@ -1397,9 +1392,7 @@ pub(crate) fn load_gguf_weights<B: Backend>(
 
             transformer = transformer.load_layer(
                 i,
-                q_proj_w,
-                k_proj_w,
-                v_proj_w,
+                qkv_proj_w,
                 o_proj_w,
                 q_norm_w,
                 k_norm_w,
