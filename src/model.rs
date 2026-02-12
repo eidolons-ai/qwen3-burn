@@ -657,14 +657,17 @@ impl<B: Backend> Qwen3<B> {
         all_tokens.push(next_token);
         generated_count += 1;
 
+        // Accumulate decoded text incrementally to avoid re-decoding the entire
+        // generated sequence on every step (which is O(n²) in total).
+        let mut decoded_text = tokenizer.decode(&[next_token]);
+
         let stop_reason = if next_token == eos_token {
             StopReason::Eos
         } else {
             // Emit first token
-            let text = tokenizer.decode(&all_tokens[prompt_len..]);
             if callback(GenerationEvent::Token {
                 token_id: next_token,
-                text,
+                text: decoded_text.clone(),
                 tokens_generated: generated_count,
             })
             .is_break()
@@ -677,7 +680,7 @@ impl<B: Backend> Qwen3<B> {
                     stop_reason: StopReason::Cancelled,
                 });
                 return Ok(GenerationOutput {
-                    text: tokenizer.decode(&all_tokens[prompt_len..]),
+                    text: decoded_text,
                     tokens: generated_count,
                     time: elapsed,
                 });
@@ -708,10 +711,10 @@ impl<B: Backend> Qwen3<B> {
                     break;
                 }
 
-                let text = tokenizer.decode(&all_tokens[prompt_len..]);
+                decoded_text.push_str(&tokenizer.decode(&[next_token]));
                 if callback(GenerationEvent::Token {
                     token_id: next_token,
-                    text,
+                    text: decoded_text.clone(),
                     tokens_generated: generated_count,
                 })
                 .is_break()
@@ -731,7 +734,7 @@ impl<B: Backend> Qwen3<B> {
             stop_reason,
         });
         Ok(GenerationOutput {
-            text: tokenizer.decode(&all_tokens[prompt_len..]),
+            text: decoded_text,
             tokens: generated_count,
             time: elapsed,
         })
