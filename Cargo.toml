@@ -13,6 +13,7 @@ ndarray = ["burn/ndarray"]
 cuda = ["burn/cuda"]
 bench = []
 profile = ["tracing-subscriber"]
+vision = ["image"]
 
 [[example]]
 name = "chat"
@@ -27,11 +28,16 @@ rand = "0.9"
 half = { version = "2.4", features = ["serde"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", optional = true }
+image = { version = "0.25", optional = true, default-features = false, features = ["png", "jpeg"] }
 
 [dev-dependencies]
 clap = { version = "4", features = ["derive"] }
 burn = { version = "0.20.0", default-features = false, features = ["std", "ndarray"] }
 criterion = { version = "0.8", features = ["html_reports"] }
+
+[[example]]
+name = "vision_chat"
+required-features = ["vision"]
 
 [[bench]]
 name = "ops"

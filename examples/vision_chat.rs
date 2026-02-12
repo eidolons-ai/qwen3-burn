@@ -3,19 +3,32 @@ use std::ops::ControlFlow;
 use std::time::Instant;
 
 use clap::Parser;
-use qwen3_burn::model::{GenerationEvent, GenerationParams, QuantizationMode, Qwen3};
+use qwen3_burn::image::ImageProcessor;
+use qwen3_burn::model::GenerationEvent;
 use qwen3_burn::sampling::Sampler;
 use qwen3_burn::tokenizer::Qwen3Tokenizer;
+use qwen3_burn::vision_model::{Qwen3VL, VLGenerationParams, VisionInput};
+use qwen3_burn::QuantizationMode;
 
-const DEFAULT_PROMPT: &str = "What is the capital of France?";
-const SYSTEM_PROMPT: &str = "You are a helpful assistant.";
+const DEFAULT_PROMPT: &str = "Describe this image in detail.";
 
 #[derive(Parser, Debug)]
-#[command(name = "qwen3-chat", about = "Qwen3 chat example using Burn")]
+#[command(
+    name = "qwen3-vl-chat",
+    about = "Qwen3-VL vision-language chat example"
+)]
 struct Args {
-    /// Path to the model directory or .gguf file
+    /// Path to the model directory (SafeTensors) or .gguf file
     #[arg(short, long)]
     model_path: String,
+
+    /// Image file path(s) (repeatable)
+    #[arg(short, long)]
+    image: Vec<String>,
+
+    /// Video frame file paths (multiple frames for video)
+    #[arg(long)]
+    video_frames: Vec<String>,
 
     /// Input prompt
     #[arg(short, long, default_value = DEFAULT_PROMPT)]
@@ -33,13 +46,9 @@ struct Args {
     #[arg(short = 'n', long, default_value_t = 256)]
     max_tokens: usize,
 
-    /// Maximum sequence length (prompt + generation)
-    #[arg(long, default_value_t = 2048)]
+    /// Maximum sequence length
+    #[arg(long, default_value_t = 4096)]
     max_seq_len: usize,
-
-    /// Prefill chunk size (tokens per chunk; omit for full-prompt prefill)
-    #[arg(long)]
-    chunk_size: Option<usize>,
 
     /// Weight quantization: auto, none, int8, int4
     #[arg(long, default_value = "auto")]
@@ -93,21 +102,84 @@ fn run<B: burn::prelude::Backend>(args: Args, device: burn::prelude::Device<B>) 
     eprintln!("Loading tokenizer...");
     let tokenizer = Qwen3Tokenizer::new(&tokenizer_path).expect("Failed to load tokenizer");
 
+    // Load model
     let quantization = parse_quantization(&args.quantize);
-    eprintln!("Loading model from {}...", args.model_path);
+    eprintln!("Loading Qwen3-VL model from {}...", args.model_path);
     let load_start = Instant::now();
     let mut model = if use_gguf {
-        Qwen3::<B>::from_gguf(&args.model_path, args.max_seq_len, quantization, &device)
+        Qwen3VL::<B>::from_gguf(&args.model_path, args.max_seq_len, quantization, &device)
             .expect("Failed to load GGUF model")
     } else {
-        Qwen3::<B>::from_pretrained(&args.model_path, args.max_seq_len, quantization, &device)
+        Qwen3VL::<B>::from_pretrained(&args.model_path, args.max_seq_len, &device)
             .expect("Failed to load model")
     };
     eprintln!("Model loaded in {:.1}s", load_start.elapsed().as_secs_f64());
 
-    // Format prompt with chat template
-    let prompt = tokenizer.apply_chat_template(SYSTEM_PROMPT, &args.prompt);
-    eprintln!("Prompt: {}", args.prompt);
+    // Preprocess images
+    let processor = ImageProcessor::default();
+    let mut image_inputs: Vec<VisionInput> = Vec::new();
+
+    for img_path in &args.image {
+        eprintln!("Processing image: {}", img_path);
+        let input = processor
+            .preprocess_image(std::path::Path::new(img_path))
+            .expect("Failed to preprocess image");
+        eprintln!(
+            "  Grid: {}x{}x{}, merge tokens: {}",
+            input.grid_thw.0, input.grid_thw.1, input.grid_thw.2, input.num_merge_tokens
+        );
+        image_inputs.push(VisionInput {
+            pixel_patches: input.pixel_patches,
+            grid_thw: input.grid_thw,
+            num_merge_tokens: input.num_merge_tokens,
+            num_patches: input.num_patches,
+            patch_embed_dim: input.patch_embed_dim,
+        });
+    }
+
+    if !args.video_frames.is_empty() {
+        eprintln!("Processing {} video frames...", args.video_frames.len());
+        let frame_paths: Vec<&std::path::Path> = args
+            .video_frames
+            .iter()
+            .map(|p| std::path::Path::new(p.as_str()))
+            .collect();
+        let input = processor
+            .preprocess_video_frames(&frame_paths)
+            .expect("Failed to preprocess video frames");
+        eprintln!(
+            "  Grid: {}x{}x{}, merge tokens: {}",
+            input.grid_thw.0, input.grid_thw.1, input.grid_thw.2, input.num_merge_tokens
+        );
+        image_inputs.push(VisionInput {
+            pixel_patches: input.pixel_patches,
+            grid_thw: input.grid_thw,
+            num_merge_tokens: input.num_merge_tokens,
+            num_patches: input.num_patches,
+            patch_embed_dim: input.patch_embed_dim,
+        });
+    }
+
+    // Build prompt with vision placeholders
+    // Format: <|im_start|>system\nYou are a helpful assistant.<|im_end|>\n
+    //         <|im_start|>user\n<|vision_start|><|image_pad|>...<|vision_end|>\n{prompt}<|im_end|>\n
+    //         <|im_start|>assistant\n
+    let mut prompt_text = String::from(
+        "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n",
+    );
+    for img in &image_inputs {
+        prompt_text.push_str("<|vision_start|>");
+        for _ in 0..img.num_merge_tokens {
+            prompt_text.push_str("<|image_pad|>");
+        }
+        prompt_text.push_str("<|vision_end|>");
+    }
+    prompt_text.push('\n');
+    prompt_text.push_str(&args.prompt);
+    prompt_text.push_str("<|im_end|>\n<|im_start|>assistant\n");
+
+    let token_ids = tokenizer.encode(&prompt_text);
+    eprintln!("Prompt tokens: {}", token_ids.len());
     eprintln!("---");
 
     // Set up sampler
@@ -117,35 +189,23 @@ fn run<B: burn::prelude::Backend>(args: Args, device: burn::prelude::Device<B>) 
         Sampler::Argmax
     };
 
-    // Generate with streaming output
+    // Generate
     let mut prev_text_len = 0;
-    let chunk_size = args.chunk_size;
-    let result = model.generate_streaming(
+    let result = model.generate_with_vision(
         &tokenizer,
-        GenerationParams {
-            prompt: &prompt,
+        &token_ids,
+        &image_inputs,
+        VLGenerationParams {
+            prompt: &prompt_text,
             max_new_tokens: args.max_tokens,
             temperature: args.temperature,
             sampler: &mut sampler,
-            prefill_chunk_size: chunk_size,
+            prefill_chunk_size: None,
         },
         |event| {
             match event {
-                GenerationEvent::PrefillProgress {
-                    chunks_completed,
-                    chunks_total,
-                    ..
-                } => {
-                    if chunks_total > 1 {
-                        eprint!("\rPrefill {}/{}...", chunks_completed, chunks_total);
-                        if chunks_completed == chunks_total {
-                            eprintln!();
-                        }
-                    }
-                }
+                GenerationEvent::PrefillProgress { .. } => {}
                 GenerationEvent::Token { ref text, .. } => {
-                    // Print only newly added characters, skipping trailing U+FFFD
-                    // from incomplete multi-byte sequences (e.g. emoji split across tokens)
                     let stable_end = text.trim_end_matches('\u{FFFD}').len();
                     if stable_end > prev_text_len {
                         let start = text.floor_char_boundary(prev_text_len);
@@ -177,6 +237,7 @@ fn run<B: burn::prelude::Backend>(args: Args, device: burn::prelude::Device<B>) 
             ControlFlow::Continue(())
         },
     );
+
     match result {
         Ok(_) => {}
         Err(e) => {
@@ -187,16 +248,6 @@ fn run<B: burn::prelude::Backend>(args: Args, device: burn::prelude::Device<B>) 
 }
 
 fn main() {
-    #[cfg(feature = "profile")]
-    {
-        use tracing_subscriber::fmt::format::FmtSpan;
-        tracing_subscriber::fmt()
-            .pretty()
-            .with_span_events(FmtSpan::CLOSE)
-            .with_target(false)
-            .init();
-    }
-
     let args = Args::parse();
 
     #[cfg(feature = "wgpu")]

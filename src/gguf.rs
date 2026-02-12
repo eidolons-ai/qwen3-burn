@@ -4,6 +4,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 use crate::model::Qwen3Config;
+use crate::vision::VisionConfig;
 
 const GGUF_MAGIC: u32 = 0x46554747; // "GGUF" as little-endian u32
 
@@ -911,6 +912,119 @@ pub(crate) fn extract_config(gguf: &GgufFile) -> Result<Qwen3Config, Box<dyn std
         decoder_sparse_step,
         norm_topk_prob,
         mlp_only_layers,
+    })
+}
+
+/// Extract VisionConfig from an mmproj GGUF file's metadata.
+///
+/// Reads `clip.vision.*` metadata keys. Fields not present in metadata use
+/// sensible defaults matching Qwen3-VL conventions.
+pub(crate) fn extract_vision_config(
+    gguf: &GgufFile,
+    text_hidden_size: usize,
+) -> Result<VisionConfig, Box<dyn std::error::Error>> {
+    let md = &gguf.metadata;
+
+    let get_u64 = |key: &str| -> Option<u64> { md.get(key).and_then(|v| v.as_u64()) };
+
+    let hidden_size = get_u64("clip.vision.embedding_length").unwrap_or(1024) as usize;
+    let depth = get_u64("clip.vision.block_count").unwrap_or(24) as usize;
+    let num_heads = get_u64("clip.vision.attention.head_count").unwrap_or(16) as usize;
+    let intermediate_size = get_u64("clip.vision.feed_forward_length").unwrap_or(4096) as usize;
+    let patch_size = get_u64("clip.vision.patch_size").unwrap_or(16) as usize;
+    let spatial_merge_size = get_u64("clip.vision.spatial_merge_size").unwrap_or(2) as usize;
+    let temporal_patch_size = 2; // always 2 for Qwen3-VL
+
+    // out_hidden_size: try projection_dim metadata, then infer from merger fc2 output shape,
+    // then fall back to text hidden_size
+    let out_hidden_size = get_u64("clip.vision.projection_dim")
+        .map(|v| v as usize)
+        .or_else(|| {
+            // Try to infer from mm.1.weight (merger fc2) tensor shape
+            // GGUF dims reversed: [in, out] → PyTorch [out, in]
+            gguf.tensors
+                .get("mm.1.weight")
+                .or_else(|| gguf.tensors.get("mm.2.weight"))
+                .and_then(|t| {
+                    if t.dims.len() == 2 {
+                        Some(t.dims[1])
+                    } else {
+                        None
+                    }
+                })
+        })
+        .unwrap_or(text_hidden_size);
+
+    // num_position_embeddings: infer from v.position_embd.weight tensor shape
+    let num_position_embeddings = gguf
+        .tensors
+        .get("v.position_embd.weight")
+        .map(|t| {
+            if t.dims.len() == 2 {
+                t.dims[1] // GGUF dims reversed: [hidden, num_pos] → num_pos
+            } else {
+                t.num_elements / hidden_size
+            }
+        })
+        .unwrap_or(2304);
+
+    // deepstack_visual_indexes: try clip.vision.is_deepstack_layers metadata first,
+    // then fall back to scanning v.deepstack.{i}.* tensor names for layer indices
+    let deepstack_visual_indexes = md
+        .get("clip.vision.is_deepstack_layers")
+        .and_then(|v| {
+            if let MetadataValue::Array(arr) = v {
+                let indices: Vec<usize> = arr
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, e)| {
+                        if e.as_bool().unwrap_or(false) {
+                            Some(i)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                if indices.is_empty() {
+                    None
+                } else {
+                    Some(indices)
+                }
+            } else {
+                None
+            }
+        })
+        .or_else(|| {
+            // Fall back: collect unique layer indices from v.deepstack.{i}.* tensor names
+            let mut ds_indices = std::collections::BTreeSet::new();
+            for name in gguf.tensors.keys() {
+                if let Some(rest) = name.strip_prefix("v.deepstack.") {
+                    if let Some(dot_pos) = rest.find('.') {
+                        if let Ok(idx) = rest[..dot_pos].parse::<usize>() {
+                            ds_indices.insert(idx);
+                        }
+                    }
+                }
+            }
+            if ds_indices.is_empty() {
+                None
+            } else {
+                Some(ds_indices.into_iter().collect())
+            }
+        });
+
+    Ok(VisionConfig {
+        hidden_size,
+        out_hidden_size,
+        depth,
+        num_heads,
+        intermediate_size,
+        patch_size,
+        spatial_merge_size,
+        temporal_patch_size,
+        in_channels: 3,
+        num_position_embeddings,
+        deepstack_visual_indexes,
     })
 }
 

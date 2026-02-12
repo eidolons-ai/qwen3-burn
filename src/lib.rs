@@ -1,11 +1,20 @@
 pub mod model;
 pub mod sampling;
 pub mod tokenizer;
+#[allow(dead_code, unused_imports, unused_variables, unused_assignments)]
+pub mod vision_model;
 
 pub(crate) mod cache;
 #[allow(dead_code)]
 pub(crate) mod gguf;
+#[allow(dead_code)]
+pub(crate) mod mrope;
 pub(crate) mod transformer;
+#[allow(dead_code)]
+pub(crate) mod vision;
+
+#[cfg(feature = "vision")]
+pub mod image;
 
 #[cfg(feature = "bench")]
 pub mod bench_internals {
