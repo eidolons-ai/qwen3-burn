@@ -29,8 +29,13 @@ src/
   cache.rs         # KvCache - pre-allocated [batch, heads, max_seq, head_dim] with sliding window
   sampling.rs      # Sampler enum: TopP (nucleus) and Argmax
   tokenizer.rs     # Qwen3Tokenizer wrapping HF `tokenizers` crate
+  vision_model.rs  # Qwen3VL<B> vision-language model: text decoder + vision encoder, generate_with_vision(), SafeTensors & GGUF loading
+  vision.rs        # Vision encoder: patch embedding, transformer blocks, spatial merge for image/video patches → token embeddings (pub(crate))
+  image.rs         # ImageProcessor: image/video preprocessing, resize, patch extraction, ffmpeg frame extraction, normalization (feature-gated: "vision")
+  mrope.rs         # Multi-Resolution RoPE (mRoPE): separate temporal/height/width rotary frequencies for vision tokens (pub(crate))
 examples/
-  chat.rs          # CLI chat app with clap, feature-gated backend selection, --format auto/safetensors/gguf
+  chat.rs          # CLI text chat app with clap, feature-gated backend selection, --format auto/safetensors/gguf
+  vision_chat.rs   # CLI vision chat app: image (--image), native video (--video, ffmpeg), pre-extracted frames (--video-frames)
 benches/
   ops.rs           # Criterion benchmarks for all core ops (NdArray backend)
 ```
@@ -123,11 +128,23 @@ python3 -c "from huggingface_hub import snapshot_download; snapshot_download('Qw
 
 # Smoke test (requires real model weights — download GGUF + tokenizer first)
 cargo test -- --ignored smoke_gguf_generate
+
+# Vision: image input
+cargo run --release --features "wgpu,vision" --example vision_chat -- \
+  --model-path ./models/Qwen3-VL-2B-Thinking-FP8 --image photo.jpg --prompt "Describe this image"
+
+# Vision: native video (requires ffmpeg/ffprobe on PATH; default --video-max-frames 8)
+cargo run --release --features "wgpu,vision" --example vision_chat -- \
+  --model-path ./models/Qwen3-VL-2B-Thinking-FP8 --video video.mov --prompt "What happens?" --max-seq-len 8192
+
+# Vision: pre-extracted video frames (shell glob expansion)
+cargo run --release --features "wgpu,vision" --example vision_chat -- \
+  --model-path ./models/Qwen3-VL-2B-Thinking-FP8 --video-frames frames/*.png --prompt "What happens?" --max-seq-len 8192
 ```
 
 The smoke test (`tests/smoke.rs`) loads Qwen3-0.6B Q8_0 GGUF with `QuantizationMode::None` (f32 on NdArray/CPU), generates a short sequence with argmax, and asserts deterministic output. It is `#[ignore]`d so `cargo test` skips it; run with `--ignored` when model files are present. A weekly CI workflow (`.github/workflows/smoke.yml`) downloads and caches the model automatically.
 
-Backend features are mutually exclusive: `wgpu` (Metal on macOS, f16), `ndarray` (CPU, f32), `cuda` (NVIDIA, f16). The `bench` feature is independent and only enables `bench_internals` re-exports for the benchmark harness.
+Backend features are mutually exclusive: `wgpu` (Metal on macOS, f16), `ndarray` (CPU, f32), `cuda` (NVIDIA, f16). The `bench` feature is independent and only enables `bench_internals` re-exports for the benchmark harness. The `vision` feature enables Qwen3-VL support (image preprocessing, vision encoder, mRoPE) and adds the `image` crate dependency.
 
 ## Commit Style
 
@@ -175,6 +192,15 @@ Criterion benchmarks (`benches/ops.rs`) measure all core ops parameterized by se
 - **Batched decode path** (`forward_batched`): for `num_tokens <= num_experts_per_tok` (decode is always 1 token). Uses GPU-side `select(0, ...)` to gather top-k expert weights, then runs a single batched matmul across all k experts simultaneously. ~6 GPU dispatches per layer instead of ~40. No CPU roundtrip for expert indices.
 - **Per-expert prefill path** (`forward_per_expert`): for prefill (many tokens). Builds a dispatch table via `HashMap<expert_idx, Vec<(token_idx, weight)>>` in one pass, then iterates only active experts (typically 8-30 unique for a short prefill) instead of all 128.
 - `Qwen3Config::is_moe_layer(i)` determines per-layer type via `decoder_sparse_step` and `mlp_only_layers`
+
+### Vision (Qwen3-VL)
+
+- `Qwen3VL<B>` (`vision_model.rs`) wraps the text decoder (`Transformer`) with a vision encoder and mRoPE, exposing `generate_with_vision()` for image/video understanding
+- **Vision encoder** (`vision.rs`): ViT-style architecture with patch embedding (Conv3D temporal=2, spatial=14x14), transformer blocks with attention, and a spatial merge layer that reduces patch count by `merge_size²` (default 2x2 = 4x reduction)
+- **mRoPE** (`mrope.rs`): Multi-Resolution Rotary Position Embedding assigns separate temporal/height/width position IDs to vision tokens, enabling the model to encode spatial-temporal structure. Text tokens use identical IDs across all three dimensions (degenerates to standard RoPE)
+- **Image preprocessing** (`image.rs`): `ImageProcessor` handles resize (constrained by min/max pixels), patch extraction, and normalization (ImageNet mean/std) for images. For video: native path calls ffmpeg/ffprobe to extract frames; pre-extracted frames path accepts individual image files. Frame count configurable via `video_max_frames` (default 8 in CLI)
+- **Prompt format**: Vision tokens use `<|vision_start|><|image_pad|>...<|vision_end|>` placeholders; the number of `<|image_pad|>` tokens equals `num_merge_tokens` from preprocessing. Video inputs additionally use `<|video_pad|>` instead of `<|image_pad|>`
+- **Token budget**: Each image/video frame produces ~480 vision tokens at default resolution (after 4x spatial merge). 4 video frames ≈ 1900 tokens; 8 frames ≈ 3900 tokens. `max_seq_len` must accommodate all vision tokens plus text prompt
 
 ### f16 Numerical Handling
 

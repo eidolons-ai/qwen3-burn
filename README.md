@@ -154,6 +154,72 @@ cargo run --release --features wgpu --example chat -- \
 | `int8` | ~1/4 | Very good | WGPU, CUDA |
 | `int4` | ~1/8 | Good | WGPU, CUDA |
 
+## Vision (Qwen3-VL)
+
+The `vision_chat` example supports Qwen3-VL vision-language models for image and video understanding. Requires the `vision` feature.
+
+**Download a model:**
+
+```bash
+python3 -c "
+from huggingface_hub import snapshot_download
+snapshot_download('Qwen/Qwen3-VL-2B-Thinking-FP8', local_dir='./models/Qwen3-VL-2B-Thinking-FP8',
+    allow_patterns=['*.safetensors', 'config.json', 'tokenizer.json'])
+"
+```
+
+**Image input:**
+
+```bash
+cargo run --release --features "wgpu,vision" --example vision_chat -- \
+  --model-path ./models/Qwen3-VL-2B-Thinking-FP8 \
+  --image photo.jpg \
+  --prompt "What do you see in this image?"
+```
+
+**Video input** (native — requires `ffmpeg` and `ffprobe` on PATH):
+
+```bash
+cargo run --release --features "wgpu,vision" --example vision_chat -- \
+  --model-path ./models/Qwen3-VL-2B-Thinking-FP8 \
+  --video video.mov \
+  --prompt "What do you see in this video?" \
+  --max-seq-len 8192
+```
+
+Frames are extracted automatically via ffmpeg. The default `--video-max-frames 8` keeps token counts manageable; increase for longer videos if you have enough GPU memory.
+
+**Video input** (pre-extracted frames):
+
+If you prefer to control frame extraction yourself, use `--video-frames` with individual image files:
+
+```bash
+# Extract frames manually
+ffmpeg -i video.mov -vf "fps=1" -frames:v 8 frames/frame_%04d.png
+
+cargo run --release --features "wgpu,vision" --example vision_chat -- \
+  --model-path ./models/Qwen3-VL-2B-Thinking-FP8 \
+  --video-frames frames/*.png \
+  --prompt "What do you see in this video?" \
+  --max-seq-len 8192
+```
+
+**Limitations:**
+- More frames = more tokens and longer prefill. 4 frames produces ~1900 vision tokens (8s prefill on Apple Silicon); 8 frames ~3900 tokens (13s prefill)
+- `--max-seq-len` must be large enough to fit all vision tokens plus the text prompt (the default 4096 is often too small for video; use 8192+)
+- Frames are paired for temporal patches (patch size = 2); odd counts are padded automatically
+- Only batch size 1 is supported
+
+**Vision chat options:**
+
+```
+--image PATH            Image file(s), repeatable (PNG/JPEG)
+--video PATH            Video file (requires ffmpeg on PATH)
+--video-frames PATH     Pre-extracted frame files (multiple, shell glob OK)
+--video-max-frames N    Max frames to extract from --video (default: 8)
+--max-seq-len N         Must accommodate vision tokens (default: 4096)
+```
+
 ## Supported Models
 
 Both dense and Mixture of Experts (MoE) Qwen3 models are supported. Preset configs are provided for:
