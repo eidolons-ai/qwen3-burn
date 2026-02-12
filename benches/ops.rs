@@ -116,7 +116,9 @@ fn bench_attention(c: &mut Criterion) {
                     let cache =
                         AttentionKvCache::<B>::new(1, NUM_KV_HEADS, MAX_SEQ, HEAD_DIM, &dev);
                     let input = Tensor::<B, 3>::ones([1, seq_len, HIDDEN], &dev);
-                    let mask = build_causal_mask::<B>(seq_len, seq_len, &dev);
+                    let mask = build_causal_mask::<B>(seq_len, seq_len, &dev)
+                        .unsqueeze::<3>()
+                        .unsqueeze::<4>();
                     (cache, input, mask)
                 },
                 |(mut cache, input, mask)| {
@@ -142,7 +144,9 @@ fn bench_attention(c: &mut Criterion) {
                         AttentionKvCache::<B>::new(1, NUM_KV_HEADS, MAX_SEQ, HEAD_DIM, &dev);
                     // Pre-fill cache
                     let prefill_input = Tensor::<B, 3>::ones([1, past, HIDDEN], &dev);
-                    let prefill_mask = build_causal_mask::<B>(past, past, &dev);
+                    let prefill_mask = build_causal_mask::<B>(past, past, &dev)
+                        .unsqueeze::<3>()
+                        .unsqueeze::<4>();
                     attn.forward(prefill_input, &rope, Some(prefill_mask), &mut cache, 0);
                     // Prepare decode input
                     let decode_input = Tensor::<B, 3>::ones([1, 1, HIDDEN], &dev);
@@ -182,7 +186,9 @@ fn bench_transformer_block(c: &mut Criterion) {
                     let cache =
                         AttentionKvCache::<B>::new(1, NUM_KV_HEADS, MAX_SEQ, HEAD_DIM, &dev);
                     let input = Tensor::<B, 3>::ones([1, seq_len, HIDDEN], &dev);
-                    let mask = build_causal_mask::<B>(seq_len, seq_len, &dev);
+                    let mask = build_causal_mask::<B>(seq_len, seq_len, &dev)
+                        .unsqueeze::<3>()
+                        .unsqueeze::<4>();
                     (cache, input, mask)
                 },
                 |(mut cache, input, mask)| {
@@ -207,7 +213,9 @@ fn bench_transformer_block(c: &mut Criterion) {
                     let mut cache =
                         AttentionKvCache::<B>::new(1, NUM_KV_HEADS, MAX_SEQ, HEAD_DIM, &dev);
                     let prefill_input = Tensor::<B, 3>::ones([1, past, HIDDEN], &dev);
-                    let prefill_mask = build_causal_mask::<B>(past, past, &dev);
+                    let prefill_mask = build_causal_mask::<B>(past, past, &dev)
+                        .unsqueeze::<3>()
+                        .unsqueeze::<4>();
                     block.forward(prefill_input, &rope, Some(prefill_mask), &mut cache, 0);
                     let decode_input = Tensor::<B, 3>::ones([1, 1, HIDDEN], &dev);
                     (cache, decode_input)

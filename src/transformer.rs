@@ -206,14 +206,14 @@ impl<B: Backend> MultiHeadAttention<B> {
     ///
     /// - `x`: `[batch, seq_len, d_model]`
     /// - `rope`: Rotary position embeddings
-    /// - `mask`: Causal attention mask `[seq_len, total_seq_len]`
+    /// - `mask`: Causal attention mask `[1, 1, q_seq, kv_seq]` (pre-unsqueezed for broadcasting)
     /// - `cache`: Optional KV cache for autoregressive generation
     /// - `start_pos`: Position offset for RoPE
     pub fn forward(
         &self,
         x: Tensor<B, 3>,
         rope: &RotaryEmbedding<B>,
-        mask: Option<Tensor<B, 2>>,
+        mask: Option<Tensor<B, 4>>,
         cache: &mut AttentionKvCache<B>,
         start_pos: usize,
     ) -> Tensor<B, 3> {
@@ -265,9 +265,9 @@ impl<B: Backend> MultiHeadAttention<B> {
         let scale = (self.head_dim as f64).sqrt().recip();
         let attn_weights = q.matmul(k.transpose()) * scale;
 
-        // Apply causal mask: mask is [q_seq, kv_seq], expand to [1, 1, q_seq, kv_seq]
+        // Apply causal mask (already [1, 1, q_seq, kv_seq] for broadcasting)
         let attn_weights = if let Some(mask) = mask {
-            attn_weights + mask.unsqueeze::<3>().unsqueeze::<4>()
+            attn_weights + mask
         } else {
             attn_weights
         };
@@ -294,7 +294,7 @@ impl<B: Backend> MultiHeadAttention<B> {
         x: Tensor<B, 3>,
         cos: Tensor<B, 2>,
         sin: Tensor<B, 2>,
-        mask: Option<Tensor<B, 2>>,
+        mask: Option<Tensor<B, 4>>,
         cache: &mut AttentionKvCache<B>,
     ) -> Tensor<B, 3> {
         let [batch, seq_len, _d_model] = x.dims();
@@ -341,7 +341,7 @@ impl<B: Backend> MultiHeadAttention<B> {
         let attn_weights = q.matmul(k.transpose()) * scale;
 
         let attn_weights = if let Some(mask) = mask {
-            attn_weights + mask.unsqueeze::<3>().unsqueeze::<4>()
+            attn_weights + mask
         } else {
             attn_weights
         };
@@ -757,7 +757,7 @@ impl<B: Backend> TransformerBlock<B> {
         &self,
         x: Tensor<B, 3>,
         rope: &RotaryEmbedding<B>,
-        mask: Option<Tensor<B, 2>>,
+        mask: Option<Tensor<B, 4>>,
         cache: &mut AttentionKvCache<B>,
         start_pos: usize,
     ) -> Tensor<B, 3> {
@@ -786,7 +786,7 @@ impl<B: Backend> TransformerBlock<B> {
         x: Tensor<B, 3>,
         cos: Tensor<B, 2>,
         sin: Tensor<B, 2>,
-        mask: Option<Tensor<B, 2>>,
+        mask: Option<Tensor<B, 4>>,
         cache: &mut AttentionKvCache<B>,
     ) -> Tensor<B, 3> {
         let x = {
@@ -917,6 +917,9 @@ impl<B: Backend> Transformer<B> {
     ) -> Tensor<B, 3> {
         let mut x = self.embed_tokens.forward(tokens);
 
+        // Pre-unsqueeze mask once: [q_seq, kv_seq] → [1, 1, q_seq, kv_seq]
+        let mask = mask.map(|m| m.unsqueeze::<3>().unsqueeze::<4>());
+
         for (i, layer) in self.layers.iter().enumerate() {
             let kind = match &layer.mlp {
                 Mlp::Dense(_) => "dense",
@@ -962,6 +965,9 @@ impl<B: Backend> Transformer<B> {
         deepstack: Option<(&[Tensor<B, 3>], Tensor<B, 3>, &[usize])>,
     ) -> Tensor<B, 3> {
         let mut x = embeddings;
+
+        // Pre-unsqueeze mask once: [q_seq, kv_seq] → [1, 1, q_seq, kv_seq]
+        let mask = mask.map(|m| m.unsqueeze::<3>().unsqueeze::<4>());
 
         for (i, layer) in self.layers.iter().enumerate() {
             let kind = match &layer.mlp {
@@ -1432,7 +1438,9 @@ mod tests {
         let block = TransformerBlock::new(32, 4, 2, 8, 64, 1e-6, &dev);
         let rope = RotaryEmbedding::new(8, 16, 10000.0, &dev);
         let mut cache = AttentionKvCache::new(1, 2, 16, 8, &dev);
-        let mask = build_causal_mask::<B>(3, 3, &dev);
+        let mask = build_causal_mask::<B>(3, 3, &dev)
+            .unsqueeze::<3>()
+            .unsqueeze::<4>();
 
         let x = Tensor::<B, 3>::ones([1, 3, 32], &dev);
         let out = block.forward(x, &rope, Some(mask), &mut cache, 0);
@@ -1445,7 +1453,9 @@ mod tests {
         let block = TransformerBlock::new_moe(32, 4, 2, 8, 4, 2, 16, true, 1e-6, &dev);
         let rope = RotaryEmbedding::new(8, 16, 10000.0, &dev);
         let mut cache = AttentionKvCache::new(1, 2, 16, 8, &dev);
-        let mask = build_causal_mask::<B>(3, 3, &dev);
+        let mask = build_causal_mask::<B>(3, 3, &dev)
+            .unsqueeze::<3>()
+            .unsqueeze::<4>();
 
         let x = Tensor::<B, 3>::ones([1, 3, 32], &dev);
         let out = block.forward(x, &rope, Some(mask), &mut cache, 0);
