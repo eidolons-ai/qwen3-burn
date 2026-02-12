@@ -31,7 +31,7 @@ struct Args {
     video: Option<String>,
 
     /// Video frame file paths (multiple pre-extracted frames for video)
-    #[arg(long)]
+    #[arg(long, num_args = 1..)]
     video_frames: Vec<String>,
 
     /// Input prompt

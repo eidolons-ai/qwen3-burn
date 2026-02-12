@@ -154,6 +154,59 @@ cargo run --release --features wgpu --example chat -- \
 | `int8` | ~1/4 | Very good | WGPU, CUDA |
 | `int4` | ~1/8 | Good | WGPU, CUDA |
 
+## Vision (Qwen3-VL)
+
+The `vision_chat` example supports Qwen3-VL vision-language models for image and video understanding. Requires the `vision` feature.
+
+**Download a model:**
+
+```bash
+python3 -c "
+from huggingface_hub import snapshot_download
+snapshot_download('Qwen/Qwen3-VL-2B-Thinking-FP8', local_dir='./models/Qwen3-VL-2B-Thinking-FP8',
+    allow_patterns=['*.safetensors', 'config.json', 'tokenizer.json'])
+"
+```
+
+**Image input:**
+
+```bash
+cargo run --release --features "wgpu,vision" --example vision_chat -- \
+  --model-path ./models/Qwen3-VL-2B-Thinking-FP8 \
+  --image photo.jpg \
+  --prompt "What do you see in this image?"
+```
+
+**Video input** (pre-extracted frames):
+
+The `--video-frames` flag accepts individual image files, not video containers (.mov, .mp4). Extract frames with ffmpeg first:
+
+```bash
+# Extract ~8 evenly-spaced frames from a video
+ffmpeg -i video.mov -vf "fps=1" -frames:v 8 frames/frame_%04d.png
+
+cargo run --release --features "wgpu,vision" --example vision_chat -- \
+  --model-path ./models/Qwen3-VL-2B-Thinking-FP8 \
+  --video-frames frames/*.png \
+  --prompt "What do you see in this video?" \
+  --max-seq-len 16384
+```
+
+**Limitations:**
+- No native video decoding — frames must be pre-extracted as PNG/JPEG images
+- More frames = more tokens and longer prefill. 4-8 frames is a practical starting point; 17 frames at full resolution produced ~8700 tokens and 32s prefill on Apple Silicon
+- `--max-seq-len` must be large enough to fit all vision tokens plus the text prompt (the default 4096 is often too small for video; use 8192-16384)
+- Frames must have an even count (temporal patch size = 2); odd counts are padded automatically
+- Only batch size 1 is supported
+
+**Vision chat options:**
+
+```
+--image PATH         Image file(s), repeatable (PNG/JPEG)
+--video-frames PATH  Video frame files (multiple, shell glob OK)
+--max-seq-len N      Must accommodate vision tokens (default: 4096)
+```
+
 ## Supported Models
 
 Both dense and Mixture of Experts (MoE) Qwen3 models are supported. Preset configs are provided for:
