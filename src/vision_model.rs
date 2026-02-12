@@ -125,6 +125,8 @@ pub struct VisionInput {
     pub num_patches: usize,
     /// Patch embedding dimension.
     pub patch_embed_dim: usize,
+    /// Whether this input is from a video (uses `<|video_pad|>` token) vs image (`<|image_pad|>`).
+    pub is_video: bool,
 }
 
 /// Generation parameters for vision-language inference.
@@ -503,22 +505,29 @@ impl<B: Backend> Qwen3VL<B> {
         let mut embeddings = self.transformer.embed_tokens().forward(token_tensor);
         // embeddings: [1, seq_len, hidden_size]
 
-        // 3. Replace image_token positions with vision features
+        // 3. Replace vision token positions with vision features
         let image_token_id = self.config.image_token_id;
+        let video_token_id = self.config.video_token_id;
 
         // Build visual mask for DeepStack: [1, seq_len, 1]
         let mut visual_mask_data = vec![0.0f32; prompt_len];
 
-        let mut scan_pos = 0; // cumulative scan position across all images
-        for (vo, _grid_thw) in &vision_outputs {
-            // Find image token positions and replace embeddings
+        let mut scan_pos = 0; // cumulative scan position across all vision inputs
+        for (img_idx, (vo, _grid_thw)) in vision_outputs.iter().enumerate() {
+            // Determine which pad token this input uses
+            let target_token_id = if images[img_idx].is_video {
+                video_token_id
+            } else {
+                image_token_id
+            };
+
             let pooler = &vo.pooler_output; // [num_merge_tokens, out_hidden_size]
             let [num_merge, out_hidden] = pooler.dims();
 
-            // Find this image's image_token_id span (continuing from previous image's end)
+            // Find this input's pad token span (continuing from previous input's end)
             let mut replaced = 0;
             while scan_pos < prompt_len && replaced < num_merge {
-                if token_ids[scan_pos] == image_token_id {
+                if token_ids[scan_pos] == target_token_id {
                     let feat = pooler
                         .clone()
                         .slice([replaced..replaced + 1, 0..out_hidden])
@@ -539,17 +548,20 @@ impl<B: Backend> Qwen3VL<B> {
             .iter()
             .map(|(_, g)| (g.0, g.1 / merge, g.2 / merge))
             .collect();
-        let position_ids = mrope::build_position_ids(token_ids, image_token_id, &merged_grid_thws);
+        let position_ids = mrope::build_position_ids(
+            token_ids,
+            &[image_token_id, video_token_id],
+            &merged_grid_thws,
+        );
 
         // 5. Compute mRoPE cos/sin
         let (cos, sin) = self.mrope.compute_cos_sin(&position_ids, &self.device);
 
-        // 6. Build DeepStack features: scatter vision features to image token positions
-        // Collect image token positions for scattering
-        let image_positions: Vec<usize> = token_ids
+        // 6. Build DeepStack features: scatter vision features to vision token positions
+        let vision_positions: Vec<usize> = token_ids
             .iter()
             .enumerate()
-            .filter(|(_, &t)| t == image_token_id)
+            .filter(|(_, &t)| t == image_token_id || t == video_token_id)
             .map(|(i, _)| i)
             .collect();
 
@@ -569,10 +581,10 @@ impl<B: Backend> Qwen3VL<B> {
 
                     for feat_idx in 0..num_merge {
                         let global_pos = img_offset + feat_idx;
-                        if global_pos >= image_positions.len() {
+                        if global_pos >= vision_positions.len() {
                             break;
                         }
-                        let pos = image_positions[global_pos];
+                        let pos = vision_positions[global_pos];
                         let f = feat
                             .clone()
                             .slice([feat_idx..feat_idx + 1, 0..out_hidden])

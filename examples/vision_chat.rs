@@ -26,7 +26,11 @@ struct Args {
     #[arg(short, long)]
     image: Vec<String>,
 
-    /// Video frame file paths (multiple frames for video)
+    /// Video file path (requires ffmpeg on PATH)
+    #[arg(long)]
+    video: Option<String>,
+
+    /// Video frame file paths (multiple pre-extracted frames for video)
     #[arg(long)]
     video_frames: Vec<String>,
 
@@ -134,6 +138,26 @@ fn run<B: burn::prelude::Backend>(args: Args, device: burn::prelude::Device<B>) 
             num_merge_tokens: input.num_merge_tokens,
             num_patches: input.num_patches,
             patch_embed_dim: input.patch_embed_dim,
+            is_video: false,
+        });
+    }
+
+    if let Some(ref video_path) = args.video {
+        eprintln!("Processing video: {}", video_path);
+        let input = processor
+            .preprocess_video(std::path::Path::new(video_path))
+            .expect("Failed to preprocess video");
+        eprintln!(
+            "  Grid: {}x{}x{}, merge tokens: {}",
+            input.grid_thw.0, input.grid_thw.1, input.grid_thw.2, input.num_merge_tokens
+        );
+        image_inputs.push(VisionInput {
+            pixel_patches: input.pixel_patches,
+            grid_thw: input.grid_thw,
+            num_merge_tokens: input.num_merge_tokens,
+            num_patches: input.num_patches,
+            patch_embed_dim: input.patch_embed_dim,
+            is_video: true,
         });
     }
 
@@ -157,6 +181,7 @@ fn run<B: burn::prelude::Backend>(args: Args, device: burn::prelude::Device<B>) 
             num_merge_tokens: input.num_merge_tokens,
             num_patches: input.num_patches,
             patch_embed_dim: input.patch_embed_dim,
+            is_video: true,
         });
     }
 
@@ -168,9 +193,14 @@ fn run<B: burn::prelude::Backend>(args: Args, device: burn::prelude::Device<B>) 
         "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n",
     );
     for img in &image_inputs {
+        let pad_token = if img.is_video {
+            "<|video_pad|>"
+        } else {
+            "<|image_pad|>"
+        };
         prompt_text.push_str("<|vision_start|>");
         for _ in 0..img.num_merge_tokens {
-            prompt_text.push_str("<|image_pad|>");
+            prompt_text.push_str(pad_token);
         }
         prompt_text.push_str("<|vision_end|>");
     }
