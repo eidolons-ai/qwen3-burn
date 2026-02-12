@@ -34,6 +34,10 @@ struct Args {
     #[arg(long, num_args = 1..)]
     video_frames: Vec<String>,
 
+    /// Maximum frames to extract from video (default: 8, higher = more tokens/memory)
+    #[arg(long, default_value_t = 8)]
+    video_max_frames: usize,
+
     /// Input prompt
     #[arg(short, long, default_value = DEFAULT_PROMPT)]
     prompt: String,
@@ -120,7 +124,8 @@ fn run<B: burn::prelude::Backend>(args: Args, device: burn::prelude::Device<B>) 
     eprintln!("Model loaded in {:.1}s", load_start.elapsed().as_secs_f64());
 
     // Preprocess images
-    let processor = ImageProcessor::default();
+    let mut processor = ImageProcessor::default();
+    processor.video_max_frames = args.video_max_frames;
     let mut image_inputs: Vec<VisionInput> = Vec::new();
 
     for img_path in &args.image {

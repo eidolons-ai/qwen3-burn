@@ -177,34 +177,47 @@ cargo run --release --features "wgpu,vision" --example vision_chat -- \
   --prompt "What do you see in this image?"
 ```
 
-**Video input** (pre-extracted frames):
-
-The `--video-frames` flag accepts individual image files, not video containers (.mov, .mp4). Extract frames with ffmpeg first:
+**Video input** (native — requires `ffmpeg` and `ffprobe` on PATH):
 
 ```bash
-# Extract ~8 evenly-spaced frames from a video
+cargo run --release --features "wgpu,vision" --example vision_chat -- \
+  --model-path ./models/Qwen3-VL-2B-Thinking-FP8 \
+  --video video.mov \
+  --prompt "What do you see in this video?" \
+  --max-seq-len 8192
+```
+
+Frames are extracted automatically via ffmpeg. The default `--video-max-frames 8` keeps token counts manageable; increase for longer videos if you have enough GPU memory.
+
+**Video input** (pre-extracted frames):
+
+If you prefer to control frame extraction yourself, use `--video-frames` with individual image files:
+
+```bash
+# Extract frames manually
 ffmpeg -i video.mov -vf "fps=1" -frames:v 8 frames/frame_%04d.png
 
 cargo run --release --features "wgpu,vision" --example vision_chat -- \
   --model-path ./models/Qwen3-VL-2B-Thinking-FP8 \
   --video-frames frames/*.png \
   --prompt "What do you see in this video?" \
-  --max-seq-len 16384
+  --max-seq-len 8192
 ```
 
 **Limitations:**
-- No native video decoding — frames must be pre-extracted as PNG/JPEG images
-- More frames = more tokens and longer prefill. 4-8 frames is a practical starting point; 17 frames at full resolution produced ~8700 tokens and 32s prefill on Apple Silicon
-- `--max-seq-len` must be large enough to fit all vision tokens plus the text prompt (the default 4096 is often too small for video; use 8192-16384)
-- Frames must have an even count (temporal patch size = 2); odd counts are padded automatically
+- More frames = more tokens and longer prefill. 4 frames produces ~1900 vision tokens (8s prefill on Apple Silicon); 8 frames ~3900 tokens (13s prefill)
+- `--max-seq-len` must be large enough to fit all vision tokens plus the text prompt (the default 4096 is often too small for video; use 8192+)
+- Frames are paired for temporal patches (patch size = 2); odd counts are padded automatically
 - Only batch size 1 is supported
 
 **Vision chat options:**
 
 ```
---image PATH         Image file(s), repeatable (PNG/JPEG)
---video-frames PATH  Video frame files (multiple, shell glob OK)
---max-seq-len N      Must accommodate vision tokens (default: 4096)
+--image PATH            Image file(s), repeatable (PNG/JPEG)
+--video PATH            Video file (requires ffmpeg on PATH)
+--video-frames PATH     Pre-extracted frame files (multiple, shell glob OK)
+--video-max-frames N    Max frames to extract from --video (default: 8)
+--max-seq-len N         Must accommodate vision tokens (default: 4096)
 ```
 
 ## Supported Models
