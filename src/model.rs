@@ -768,6 +768,35 @@ fn sample_token<B: Backend>(logits: &Tensor<B, 2>, temperature: f64, sampler: &m
 
 type TensorMap = HashMap<String, (Vec<f32>, Vec<usize>)>;
 
+/// Convert a single FP8 E4M3FN byte to f32.
+/// Format: 1 sign, 4 exponent (bias=7), 3 mantissa. No infinities; 0x7F/0xFF are NaN.
+#[inline]
+pub(crate) fn fp8_e4m3_to_f32(b: u8) -> f32 {
+    let sign = (b >> 7) & 1;
+    let exp = (b >> 3) & 0xF;
+    let mantissa = b & 0x7;
+
+    if exp == 0xF && mantissa == 0x7 {
+        return f32::NAN;
+    }
+
+    if exp == 0 {
+        // Subnormal: value = (-1)^sign * 2^(1-bias) * (mantissa / 8)
+        if mantissa == 0 {
+            return if sign == 1 { -0.0 } else { 0.0 };
+        }
+        // Direct computation for subnormals (rare, only 7 values per sign)
+        let val = (mantissa as f32) * (1.0 / 8.0) * (1.0 / 64.0); // 2^(1-7) = 2^-6 = 1/64
+        return if sign == 1 { -val } else { val };
+    }
+
+    // Normal: value = (-1)^sign * 2^(exp-7) * (1 + mantissa/8)
+    // Rebias: f32_bias(127) - fp8_bias(7) = 120
+    let fexp = (exp as u32) + 120;
+    let bits = (sign as u32) << 31 | fexp << 23 | (mantissa as u32) << 20;
+    f32::from_bits(bits)
+}
+
 /// Remove a 1D tensor from the map, consuming the f32 data (no clone).
 fn take_tensor_1d<B: Backend>(
     map: &mut TensorMap,
@@ -1021,6 +1050,9 @@ fn load_safetensors_weights<B: Backend>(
                         .chunks_exact(2)
                         .map(|chunk| half::bf16::from_le_bytes([chunk[0], chunk[1]]).to_f32())
                         .collect(),
+                    safetensors::Dtype::F8_E4M3 => {
+                        data.iter().map(|&b| fp8_e4m3_to_f32(b)).collect()
+                    }
                     _ => {
                         return Err(
                             format!("Unsupported dtype {:?} for tensor {}", dtype, name).into()
@@ -1029,6 +1061,43 @@ fn load_safetensors_weights<B: Backend>(
                 };
 
                 tensor_map.insert(name.to_string(), (float_data, shape));
+            }
+        }
+
+        // Apply FP8 block-wise dequantization: for each weight_scale_inv tensor,
+        // multiply the corresponding weight by the per-block scale factors.
+        let scale_keys: Vec<String> = tensor_map
+            .keys()
+            .filter(|k| k.ends_with(".weight_scale_inv"))
+            .cloned()
+            .collect();
+        for scale_key in scale_keys {
+            let weight_key = scale_key.replace(".weight_scale_inv", ".weight");
+            let (scale_data, scale_shape) = match tensor_map.remove(&scale_key) {
+                Some(v) => v,
+                None => continue,
+            };
+            if let Some((weight_data, weight_shape)) = tensor_map.get_mut(&weight_key) {
+                debug_assert_eq!(scale_shape.len(), 2);
+                let block_rows = scale_shape[0];
+                let block_cols = scale_shape[1];
+                let rows = weight_shape[0];
+                let cols = weight_shape[1];
+                let brow_size = rows / block_rows;
+                let bcol_size = cols / block_cols;
+                for br in 0..block_rows {
+                    for bc in 0..block_cols {
+                        let scale = scale_data[br * block_cols + bc];
+                        let row_start = br * brow_size;
+                        let col_start = bc * bcol_size;
+                        for r in row_start..row_start + brow_size {
+                            let offset = r * cols + col_start;
+                            for v in &mut weight_data[offset..offset + bcol_size] {
+                                *v *= scale;
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -1993,5 +2062,62 @@ mod tests {
             tensor_data_offset: 0,
         };
         assert_eq!(detect_gguf_quantization(&gguf), QuantizationMode::None);
+    }
+
+    #[test]
+    fn fp8_e4m3_zero() {
+        assert_eq!(fp8_e4m3_to_f32(0x00), 0.0);
+        assert!(fp8_e4m3_to_f32(0x80).is_sign_negative()); // -0.0
+        assert_eq!(fp8_e4m3_to_f32(0x80).to_bits(), (-0.0f32).to_bits());
+    }
+
+    #[test]
+    fn fp8_e4m3_nan() {
+        assert!(fp8_e4m3_to_f32(0x7F).is_nan()); // 0_1111_111
+        assert!(fp8_e4m3_to_f32(0xFF).is_nan()); // 1_1111_111
+    }
+
+    #[test]
+    fn fp8_e4m3_one() {
+        // 1.0 = 0_0111_000 (exp=7, mantissa=0 => 2^(7-7)*(1+0) = 1.0)
+        assert_eq!(fp8_e4m3_to_f32(0x38), 1.0);
+        // -1.0 = 1_0111_000
+        assert_eq!(fp8_e4m3_to_f32(0xB8), -1.0);
+    }
+
+    #[test]
+    fn fp8_e4m3_max() {
+        // Max normal: 0_1111_110 => 2^(15-7) * (1 + 6/8) = 256 * 1.75 = 448
+        assert_eq!(fp8_e4m3_to_f32(0x7E), 448.0);
+        assert_eq!(fp8_e4m3_to_f32(0xFE), -448.0);
+    }
+
+    #[test]
+    fn fp8_e4m3_smallest_normal() {
+        // Smallest normal: 0_0001_000 => 2^(1-7) * 1.0 = 2^-6
+        assert_eq!(fp8_e4m3_to_f32(0x08), f32::powi(2.0, -6));
+    }
+
+    #[test]
+    fn fp8_e4m3_subnormals() {
+        // Subnormal: 0_0000_001 => 2^(1-7) * (1/8) = 2^-9
+        assert_eq!(fp8_e4m3_to_f32(0x01), f32::powi(2.0, -9));
+        // Subnormal: 0_0000_100 => 2^(1-7) * (4/8) = 2^-7
+        assert_eq!(fp8_e4m3_to_f32(0x04), f32::powi(2.0, -7));
+        // Largest subnormal: 0_0000_111 => 2^(1-7) * (7/8) = 7 * 2^-9
+        let expected = 7.0 * f32::powi(2.0, -9);
+        assert!((fp8_e4m3_to_f32(0x07) - expected).abs() < 1e-10);
+    }
+
+    #[test]
+    fn fp8_e4m3_common_values() {
+        // 0.5 = 0_0110_000 => 2^(6-7) = 0.5
+        assert_eq!(fp8_e4m3_to_f32(0x30), 0.5);
+        // 2.0 = 0_1000_000 => 2^(8-7) = 2.0
+        assert_eq!(fp8_e4m3_to_f32(0x40), 2.0);
+        // 1.5 = 0_0111_100 => 2^0 * (1 + 4/8) = 1.5
+        assert_eq!(fp8_e4m3_to_f32(0x3C), 1.5);
+        // 0.125 = 0_0100_000 => 2^(4-7) = 0.125
+        assert_eq!(fp8_e4m3_to_f32(0x20), 0.125);
     }
 }

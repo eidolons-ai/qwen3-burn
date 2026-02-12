@@ -822,10 +822,51 @@ fn load_vl_safetensors_weights<B: Backend>(
                         .chunks_exact(2)
                         .map(|chunk| half::bf16::from_le_bytes([chunk[0], chunk[1]]).to_f32())
                         .collect(),
+                    safetensors::Dtype::F8_E4M3 => data
+                        .iter()
+                        .map(|&b| crate::model::fp8_e4m3_to_f32(b))
+                        .collect(),
                     _ => continue,
                 };
 
                 tensor_map.insert(name.to_string(), (float_data, shape));
+            }
+        }
+
+        // Apply FP8 block-wise dequantization: for each weight_scale_inv tensor,
+        // multiply the corresponding weight by the per-block scale factors.
+        let scale_keys: Vec<String> = tensor_map
+            .keys()
+            .filter(|k| k.ends_with(".weight_scale_inv"))
+            .cloned()
+            .collect();
+        for scale_key in scale_keys {
+            let weight_key = scale_key.replace(".weight_scale_inv", ".weight");
+            let (scale_data, scale_shape) = match tensor_map.remove(&scale_key) {
+                Some(v) => v,
+                None => continue,
+            };
+            if let Some((weight_data, weight_shape)) = tensor_map.get_mut(&weight_key) {
+                debug_assert_eq!(scale_shape.len(), 2);
+                let block_rows = scale_shape[0];
+                let block_cols = scale_shape[1];
+                let rows = weight_shape[0];
+                let cols = weight_shape[1];
+                let brow_size = rows / block_rows;
+                let bcol_size = cols / block_cols;
+                for br in 0..block_rows {
+                    for bc in 0..block_cols {
+                        let scale = scale_data[br * block_cols + bc];
+                        let row_start = br * brow_size;
+                        let col_start = bc * bcol_size;
+                        for r in row_start..row_start + brow_size {
+                            let offset = r * cols + col_start;
+                            for v in &mut weight_data[offset..offset + bcol_size] {
+                                *v *= scale;
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -970,11 +1011,13 @@ fn load_vl_safetensors_weights<B: Backend>(
             transformer = transformer.load_norm(norm_weight);
         }
 
-        if !tc.tie_word_embeddings {
-            let lm_key = "model.language_model.lm_head.weight";
+        // Load lm_head if stored explicitly (some FP8 models store it even with
+        // tie_word_embeddings=true since the head uses a different dtype).
+        for lm_key in ["model.language_model.lm_head.weight", "lm_head.weight"] {
             if tensor_map.contains_key(lm_key) {
                 let w = take_linear_weight(&mut tensor_map, lm_key, device)?;
-                transformer = transformer.load_lm_head(w);
+                lm_head_weight = Some(w);
+                break;
             }
         }
     }
