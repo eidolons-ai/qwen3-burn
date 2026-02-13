@@ -232,14 +232,24 @@ fn main() {
         run::<Mlx>(args, device);
     }
 
+    #[cfg(feature = "metal")]
+    {
+        use burn::backend::wgpu::WgpuDevice;
+        use burn::backend::Wgpu;
+        use burn::tensor::f16;
+        let device = WgpuDevice::default();
+        run::<Wgpu<f16, i32>>(args, device);
+    }
+
     #[cfg(not(any(
         feature = "wgpu",
         feature = "ndarray",
         feature = "cuda",
-        feature = "mlx"
+        feature = "mlx",
+        feature = "metal"
     )))]
     {
-        eprintln!("No backend feature enabled. Use --features wgpu, ndarray, cuda, or mlx.");
+        eprintln!("No backend feature enabled. Use --features wgpu, ndarray, cuda, mlx, or metal.");
         std::process::exit(1);
     }
 }
