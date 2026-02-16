@@ -675,6 +675,7 @@ impl<B: Backend> Qwen3VL<B> {
             }
         }
 
+        let _ = B::sync(&self.device);
         let prefill_time = start_time.elapsed().as_secs_f64();
 
         if cancelled {
