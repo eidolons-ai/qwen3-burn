@@ -1,3 +1,4 @@
+use std::any::TypeId;
 use std::collections::HashMap;
 use std::ops::ControlFlow;
 use std::path::Path;
@@ -9,8 +10,8 @@ use serde::Deserialize;
 
 use crate::gguf;
 use crate::model::{
-    apply_quantization, detect_gguf_quantization, load_gguf_weights, GenerationEvent,
-    GenerationOutput, QuantizationMode, StopReason,
+    apply_quantization, detect_gguf_quantization, load_gguf_weights, make_tensor_data,
+    GenerationEvent, GenerationOutput, QuantizationMode, StopReason, WeightData,
 };
 use crate::mrope::{self, MRopeEmbedding};
 use crate::sampling::Sampler;
@@ -1108,9 +1109,9 @@ fn load_gguf_vision_weights<B: Backend>(
     Ok(vision_encoder)
 }
 
-type TensorMap = HashMap<String, (Vec<f32>, Vec<usize>)>;
+type TensorMap = HashMap<String, (WeightData, Vec<usize>)>;
 
-/// Remove a 1D tensor from the map.
+/// Remove a 1D tensor from the map, creating TensorData in the backend's native float type.
 fn take_tensor_1d<B: Backend>(
     map: &mut TensorMap,
     name: &str,
@@ -1120,10 +1121,13 @@ fn take_tensor_1d<B: Backend>(
         .remove(name)
         .ok_or_else(|| format!("Tensor '{}' not found", name))?;
     let len = data.len();
-    Ok(Tensor::from_data(TensorData::new(data, [len]), device))
+    Ok(Tensor::from_data(
+        data.into_tensor_data::<B>(vec![len]),
+        device,
+    ))
 }
 
-/// Remove a 2D tensor (no transpose).
+/// Remove a 2D tensor (no transpose), creating TensorData in the backend's native float type.
 fn take_tensor_2d<B: Backend>(
     map: &mut TensorMap,
     name: &str,
@@ -1132,10 +1136,7 @@ fn take_tensor_2d<B: Backend>(
     let (data, shape) = map
         .remove(name)
         .ok_or_else(|| format!("Tensor '{}' not found", name))?;
-    Ok(Tensor::from_data(
-        TensorData::new(data, [shape[0], shape[1]]),
-        device,
-    ))
+    Ok(Tensor::from_data(data.into_tensor_data::<B>(shape), device))
 }
 
 /// Remove a 2D Linear weight and transpose [out, in] -> [in, out].
@@ -1307,6 +1308,7 @@ fn load_vl_safetensors_weights<B: Backend>(
         .clone()
         .unwrap_or_default();
     let mut next_ds_merger: usize = 0;
+    let use_f16 = TypeId::of::<B::FloatElem>() == TypeId::of::<half::f16>();
 
     // Stream weights shard-by-shard: after reading each shard file, completed layers are
     // loaded into the model immediately and their f32 data is freed. This keeps peak memory
@@ -1324,27 +1326,57 @@ fn load_vl_safetensors_weights<B: Backend>(
                 let dtype = tensor_view.dtype();
                 let data = tensor_view.data();
 
-                let float_data: Vec<f32> = match dtype {
-                    safetensors::Dtype::F32 => data
-                        .chunks_exact(4)
-                        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-                        .collect(),
-                    safetensors::Dtype::F16 => data
-                        .chunks_exact(2)
-                        .map(|chunk| half::f16::from_le_bytes([chunk[0], chunk[1]]).to_f32())
-                        .collect(),
-                    safetensors::Dtype::BF16 => data
-                        .chunks_exact(2)
-                        .map(|chunk| half::bf16::from_le_bytes([chunk[0], chunk[1]]).to_f32())
-                        .collect(),
-                    safetensors::Dtype::F8_E4M3 => data
-                        .iter()
-                        .map(|&b| crate::model::fp8_e4m3_to_f32(b))
-                        .collect(),
-                    _ => continue,
+                // Load weights in the backend's native float type when possible.
+                // FP8 always goes through f32 for block-wise dequantization scaling.
+                let weight_data = if use_f16 && dtype != safetensors::Dtype::F8_E4M3 {
+                    let f16_data: Vec<half::f16> = match dtype {
+                        safetensors::Dtype::F16 => data
+                            .chunks_exact(2)
+                            .map(|c| half::f16::from_le_bytes([c[0], c[1]]))
+                            .collect(),
+                        safetensors::Dtype::BF16 => data
+                            .chunks_exact(2)
+                            .map(|c| {
+                                half::f16::from_f32(
+                                    half::bf16::from_le_bytes([c[0], c[1]]).to_f32(),
+                                )
+                            })
+                            .collect(),
+                        safetensors::Dtype::F32 => data
+                            .chunks_exact(4)
+                            .map(|c| {
+                                half::f16::from_f32(f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                            })
+                            .collect(),
+                        _ => continue,
+                    };
+                    WeightData::F16(f16_data)
+                } else {
+                    let f32_data: Vec<f32> = match dtype {
+                        safetensors::Dtype::F32 => data
+                            .chunks_exact(4)
+                            .map(|chunk| {
+                                f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])
+                            })
+                            .collect(),
+                        safetensors::Dtype::F16 => data
+                            .chunks_exact(2)
+                            .map(|chunk| half::f16::from_le_bytes([chunk[0], chunk[1]]).to_f32())
+                            .collect(),
+                        safetensors::Dtype::BF16 => data
+                            .chunks_exact(2)
+                            .map(|chunk| half::bf16::from_le_bytes([chunk[0], chunk[1]]).to_f32())
+                            .collect(),
+                        safetensors::Dtype::F8_E4M3 => data
+                            .iter()
+                            .map(|&b| crate::model::fp8_e4m3_to_f32(b))
+                            .collect(),
+                        _ => continue,
+                    };
+                    WeightData::F32(f32_data)
                 };
 
-                tensor_map.insert(name.to_string(), (float_data, shape));
+                tensor_map.insert(name.to_string(), (weight_data, shape));
             }
         }
 
@@ -1357,27 +1389,30 @@ fn load_vl_safetensors_weights<B: Backend>(
             .collect();
         for scale_key in scale_keys {
             let weight_key = scale_key.replace(".weight_scale_inv", ".weight");
-            let (scale_data, scale_shape) = match tensor_map.remove(&scale_key) {
+            let (scale_wd, scale_shape) = match tensor_map.remove(&scale_key) {
                 Some(v) => v,
                 None => continue,
             };
-            if let Some((weight_data, weight_shape)) = tensor_map.get_mut(&weight_key) {
-                debug_assert_eq!(scale_shape.len(), 2);
-                let block_rows = scale_shape[0];
-                let block_cols = scale_shape[1];
-                let rows = weight_shape[0];
-                let cols = weight_shape[1];
-                let brow_size = rows / block_rows;
-                let bcol_size = cols / block_cols;
-                for br in 0..block_rows {
-                    for bc in 0..block_cols {
-                        let scale = scale_data[br * block_cols + bc];
-                        let row_start = br * brow_size;
-                        let col_start = bc * bcol_size;
-                        for r in row_start..row_start + brow_size {
-                            let offset = r * cols + col_start;
-                            for v in &mut weight_data[offset..offset + bcol_size] {
-                                *v *= scale;
+            let scale_data = scale_wd.into_f32();
+            if let Some((weight_wd, weight_shape)) = tensor_map.get_mut(&weight_key) {
+                if let Some(weight_data) = weight_wd.as_f32_mut() {
+                    debug_assert_eq!(scale_shape.len(), 2);
+                    let block_rows = scale_shape[0];
+                    let block_cols = scale_shape[1];
+                    let rows = weight_shape[0];
+                    let cols = weight_shape[1];
+                    let brow_size = rows / block_rows;
+                    let bcol_size = cols / block_cols;
+                    for br in 0..block_rows {
+                        for bc in 0..block_cols {
+                            let scale = scale_data[br * block_cols + bc];
+                            let row_start = br * brow_size;
+                            let col_start = bc * bcol_size;
+                            for r in row_start..row_start + brow_size {
+                                let offset = r * cols + col_start;
+                                for v in &mut weight_data[offset..offset + bcol_size] {
+                                    *v *= scale;
+                                }
                             }
                         }
                     }
@@ -1419,7 +1454,9 @@ fn load_vl_safetensors_weights<B: Backend>(
             let (data, shape) = tensor_map.remove(patch_key).unwrap();
             let out_dim = shape[0];
             let in_dim: usize = shape[1..].iter().product();
-            let weight = Tensor::<B, 1>::from_floats(&data[..], device).reshape([out_dim, in_dim]);
+            let len = data.len();
+            let weight = Tensor::<B, 1>::from_data(data.into_tensor_data::<B>(vec![len]), device)
+                .reshape([out_dim, in_dim]);
             let bias = take_tensor_1d(&mut tensor_map, patch_bias_key, device)?;
             vision_encoder = vision_encoder.load_patch_embed(weight, bias);
         }
