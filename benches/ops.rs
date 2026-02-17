@@ -2,10 +2,6 @@
 //
 // Uses NdArray (CPU) backend for CI-friendly benchmarks. All dimensions match
 // Qwen3-0.6B (hidden=1024, heads=16, kv_heads=8, head_dim=128, intermediate=3072).
-//
-// GPU sync note: When running with WGPU backend, add `B::sync(&device)` after
-// each forward call inside `b.iter()` to ensure GPU work completes before timing
-// stops. NdArray is synchronous so no sync is needed here.
 
 use std::hint::black_box;
 
