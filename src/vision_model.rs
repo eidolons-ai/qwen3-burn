@@ -154,6 +154,9 @@ pub struct Qwen3VL<B: Backend> {
     pub(crate) eos_token_id: u32,
     pub(crate) max_seq_len: usize,
     pub(crate) device: Device<B>,
+    /// Pre-computed cos/sin for text-only decode (mRoPE → standard RoPE).
+    decode_cos: Tensor<B, 2>,
+    decode_sin: Tensor<B, 2>,
 }
 
 impl<B: Backend> Qwen3VL<B> {
@@ -215,6 +218,8 @@ impl<B: Backend> Qwen3VL<B> {
         let (transformer, vision_encoder) =
             load_vl_safetensors_weights(transformer, vision_encoder, model_dir, &config, device)?;
 
+        let (decode_cos, decode_sin) = mrope.precompute_text_tables(max_seq_len, device);
+
         let caches = (0..tc.num_hidden_layers)
             .map(|_| {
                 AttentionKvCache::new(1, tc.num_key_value_heads, max_seq_len, tc.head_dim, device)
@@ -231,6 +236,8 @@ impl<B: Backend> Qwen3VL<B> {
             eos_token_id,
             max_seq_len,
             device: device.clone(),
+            decode_cos,
+            decode_sin,
         })
     }
 
@@ -435,7 +442,10 @@ impl<B: Backend> Qwen3VL<B> {
             device,
         );
 
-        // 12. Create KV caches
+        // 12. Pre-compute text-only decode RoPE tables
+        let (decode_cos, decode_sin) = mrope.precompute_text_tables(max_seq_len, device);
+
+        // 13. Create KV caches
         let caches = (0..config.text_config.num_hidden_layers)
             .map(|_| {
                 AttentionKvCache::new(
@@ -458,6 +468,8 @@ impl<B: Backend> Qwen3VL<B> {
             eos_token_id,
             max_seq_len,
             device: device.clone(),
+            decode_cos,
+            decode_sin,
         })
     }
 
@@ -726,19 +738,18 @@ impl<B: Backend> Qwen3VL<B> {
             .ok_or_else(|| "prompt must not be empty (encoded to zero tokens)".to_string())?;
         let mut next_token = sample_token(&logits_2d, params.temperature, params.sampler);
         let eos_token = self.eos_token_id;
-        let mut all_tokens: Vec<u32> = token_ids.to_vec();
-        all_tokens.push(next_token);
         let mut generated_count = 1;
+
+        // Accumulate decoded text incrementally to avoid re-decoding the entire
+        // generated sequence on every step (which is O(n²) in total).
+        let mut decoded_text = tokenizer.decode(&[next_token], true).unwrap_or_default();
 
         let stop_reason = if next_token == eos_token {
             StopReason::Eos
         } else {
-            let text = tokenizer
-                .decode(&all_tokens[prompt_len..], true)
-                .unwrap_or_default();
             if callback(GenerationEvent::Token {
                 token_id: next_token,
-                text,
+                text: decoded_text.clone(),
                 tokens_generated: generated_count,
             })
             .is_break()
@@ -751,16 +762,13 @@ impl<B: Backend> Qwen3VL<B> {
                     stop_reason: StopReason::Cancelled,
                 });
                 return Ok(GenerationOutput {
-                    text: tokenizer
-                        .decode(&all_tokens[prompt_len..], true)
-                        .unwrap_or_default(),
+                    text: decoded_text,
                     tokens: generated_count,
                     time: elapsed,
                 });
             }
 
             // 9. Autoregressive decode
-            let mut pos = prompt_len;
             let mut text_pos = position_ids[0].last().copied().unwrap_or(0) + 1;
             let mut stop = StopReason::MaxTokens;
 
@@ -770,9 +778,9 @@ impl<B: Backend> Qwen3VL<B> {
                     Tensor::<B, 1, Int>::from_data(td, &self.device).unsqueeze::<2>();
                 let token_emb = self.transformer.embed_tokens().forward(token_tensor);
 
-                // Text-only decode: all 3 mRoPE dims identical
-                let decode_pos_ids = vec![vec![text_pos], vec![text_pos], vec![text_pos]];
-                let (cos, sin) = self.mrope.compute_cos_sin(&decode_pos_ids, &self.device);
+                // Slice from pre-computed table (mRoPE → standard RoPE for text-only decode)
+                let cos = self.decode_cos.clone().slice([text_pos..text_pos + 1]);
+                let sin = self.decode_sin.clone().slice([text_pos..text_pos + 1]);
 
                 let logits = self.transformer.forward_from_embeddings(
                     token_emb,
@@ -785,9 +793,7 @@ impl<B: Backend> Qwen3VL<B> {
 
                 let logits = logits.reshape([1, tc.vocab_size]);
                 next_token = sample_token(&logits, params.temperature, params.sampler);
-                all_tokens.push(next_token);
                 generated_count += 1;
-                pos += 1;
                 text_pos += 1;
 
                 if next_token == eos_token {
@@ -795,12 +801,10 @@ impl<B: Backend> Qwen3VL<B> {
                     break;
                 }
 
-                let text = tokenizer
-                    .decode(&all_tokens[prompt_len..], true)
-                    .unwrap_or_default();
+                decoded_text.push_str(&tokenizer.decode(&[next_token], true).unwrap_or_default());
                 if callback(GenerationEvent::Token {
                     token_id: next_token,
-                    text,
+                    text: decoded_text.clone(),
                     tokens_generated: generated_count,
                 })
                 .is_break()
@@ -821,9 +825,7 @@ impl<B: Backend> Qwen3VL<B> {
         });
 
         Ok(GenerationOutput {
-            text: tokenizer
-                .decode(&all_tokens[prompt_len..], true)
-                .unwrap_or_default(),
+            text: decoded_text,
             tokens: generated_count,
             time: elapsed,
         })

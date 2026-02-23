@@ -103,6 +103,39 @@ impl<B: Backend> MRopeEmbedding<B> {
 
         (cos, sin)
     }
+
+    /// Pre-compute cos/sin tables for sequential text-only positions.
+    ///
+    /// When all 3 mRoPE dimensions use the same position (text-only decode),
+    /// the formula degenerates to standard RoPE: `angle = pos * inv_freq[i]`
+    /// regardless of dim assignment. This allows pre-computing the table once
+    /// at init and slicing during decode, avoiding per-step CPU→GPU transfers.
+    pub fn precompute_text_tables(
+        &self,
+        max_positions: usize,
+        device: &Device<B>,
+    ) -> (Tensor<B, 2>, Tensor<B, 2>) {
+        let half_dim = self.head_dim / 2;
+        let mut cos_data = Vec::with_capacity(max_positions * self.head_dim);
+        let mut sin_data = Vec::with_capacity(max_positions * self.head_dim);
+
+        for pos in 0..max_positions {
+            for freq_idx in 0..half_dim {
+                let angle = pos as f64 * self.inv_freq[freq_idx];
+                cos_data.push(angle.cos() as f32);
+                sin_data.push(angle.sin() as f32);
+            }
+            let start = cos_data.len() - half_dim;
+            cos_data.extend_from_within(start..);
+            sin_data.extend_from_within(start..);
+        }
+
+        let cos = Tensor::<B, 1>::from_floats(&cos_data[..], device)
+            .reshape([max_positions, self.head_dim]);
+        let sin = Tensor::<B, 1>::from_floats(&sin_data[..], device)
+            .reshape([max_positions, self.head_dim]);
+        (cos, sin)
+    }
 }
 
 /// Build the dimension assignment mapping: freq_idx -> component (0=T, 1=H, 2=W).
