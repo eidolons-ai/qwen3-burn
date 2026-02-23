@@ -779,7 +779,9 @@ impl<B: Backend> Qwen3VL<B> {
                 let token_emb = self.transformer.embed_tokens().forward(token_tensor);
 
                 // Slice from pre-computed table (mRoPE → standard RoPE for text-only decode)
+                #[allow(clippy::single_range_in_vec_init)]
                 let cos = self.decode_cos.clone().slice([text_pos..text_pos + 1]);
+                #[allow(clippy::single_range_in_vec_init)]
                 let sin = self.decode_sin.clone().slice([text_pos..text_pos + 1]);
 
                 let logits = self.transformer.forward_from_embeddings(

@@ -124,8 +124,10 @@ fn run<B: burn::prelude::Backend>(args: Args, device: burn::prelude::Device<B>) 
     eprintln!("Model loaded in {:.1}s", load_start.elapsed().as_secs_f64());
 
     // Preprocess images
-    let mut processor = ImageProcessor::default();
-    processor.video_max_frames = args.video_max_frames;
+    let processor = ImageProcessor {
+        video_max_frames: args.video_max_frames,
+        ..Default::default()
+    };
     let mut image_inputs: Vec<VisionInput> = Vec::new();
 
     for img_path in &args.image {
