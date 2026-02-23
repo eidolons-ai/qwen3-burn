@@ -489,7 +489,7 @@ dependencies = [
 [[package]]
 name = "burn-mlx"
 version = "0.1.2"
-source = "git+https://github.com/eidolons-ai/burn-mlx.git?branch=burn-0-20#c3e19bf7df4cb283ae0eda4da2263e437e80abe4"
+source = "git+https://github.com/eidolons-ai/burn-mlx.git?branch=main#316095e7397dc9b772f2a16729cfb904ded77758"
 dependencies = [
  "burn",
  "burn-tensor",

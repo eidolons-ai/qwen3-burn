@@ -903,16 +903,22 @@ fn load_gguf_vision_weights<B: Backend>(
 
     let make_1d = |data: Vec<f32>, device: &Device<B>| -> Tensor<B, 1> {
         let len = data.len();
-        Tensor::from_data(TensorData::new(data, [len]), device)
+        Tensor::from_data(make_tensor_data::<B>(data, vec![len]), device)
     };
 
     let make_2d = |data: Vec<f32>, shape: &[usize], device: &Device<B>| -> Tensor<B, 2> {
-        Tensor::from_data(TensorData::new(data, [shape[0], shape[1]]), device)
+        Tensor::from_data(
+            make_tensor_data::<B>(data, vec![shape[0], shape[1]]),
+            device,
+        )
     };
 
     // 2D linear weight: transpose [out, in] -> [in, out]
     let make_2d_linear = |data: Vec<f32>, shape: &[usize], device: &Device<B>| -> Tensor<B, 2> {
-        let t = Tensor::from_data(TensorData::new(data, [shape[0], shape[1]]), device);
+        let t = Tensor::from_data(
+            make_tensor_data::<B>(data, vec![shape[0], shape[1]]),
+            device,
+        );
         t.transpose()
     };
 
@@ -943,11 +949,17 @@ fn load_gguf_vision_weights<B: Backend>(
                 combined.extend_from_slice(&data1[start..start + slice_dim]);
             }
             let total_dim = 2 * slice_dim;
-            Tensor::<B, 1>::from_data(TensorData::new(combined, [out_dim * total_dim]), device)
-                .reshape([out_dim, total_dim])
+            Tensor::<B, 1>::from_data(
+                make_tensor_data::<B>(combined, vec![out_dim * total_dim]),
+                device,
+            )
+            .reshape([out_dim, total_dim])
         } else {
-            Tensor::<B, 1>::from_data(TensorData::new(data0, [out_dim * slice_dim]), device)
-                .reshape([out_dim, slice_dim])
+            Tensor::<B, 1>::from_data(
+                make_tensor_data::<B>(data0, vec![out_dim * slice_dim]),
+                device,
+            )
+            .reshape([out_dim, slice_dim])
         };
 
         let (bias_data, _) = read_tensor(file, "v.patch_embd.bias")?;

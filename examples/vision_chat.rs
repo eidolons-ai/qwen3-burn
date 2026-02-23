@@ -313,9 +313,9 @@ fn main() {
 
     #[cfg(feature = "mlx")]
     {
-        use burn_mlx::{Mlx, MlxDevice};
+        use burn_mlx::{MlxDevice, MlxHalf};
         let device = MlxDevice::Gpu;
-        run::<Mlx>(args, device);
+        run::<MlxHalf>(args, device);
     }
 
     #[cfg(feature = "metal")]
