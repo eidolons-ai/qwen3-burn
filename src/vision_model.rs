@@ -1,3 +1,4 @@
+use std::any::TypeId;
 use std::collections::HashMap;
 use std::ops::ControlFlow;
 use std::path::Path;
@@ -9,12 +10,11 @@ use serde::Deserialize;
 
 use crate::gguf;
 use crate::model::{
-    apply_quantization, detect_gguf_quantization, load_gguf_weights, GenerationEvent,
-    GenerationOutput, QuantizationMode, StopReason,
+    apply_quantization, detect_gguf_quantization, load_gguf_weights, make_tensor_data,
+    GenerationEvent, GenerationOutput, QuantizationMode, StopReason, WeightData,
 };
 use crate::mrope::{self, MRopeEmbedding};
 use crate::sampling::Sampler;
-use crate::tokenizer::Qwen3Tokenizer;
 use crate::transformer::{build_causal_mask, AttentionKvCache, Transformer};
 use crate::vision::{VisionConfig, VisionEncoder};
 
@@ -62,6 +62,8 @@ pub struct Qwen3VLConfig {
     pub vision_start_token_id: u32,
     #[serde(default = "default_vision_end_token_id")]
     pub vision_end_token_id: u32,
+    #[serde(default = "default_eos_token_id")]
+    pub eos_token_id: u32,
 }
 
 fn default_image_token_id() -> u32 {
@@ -75,6 +77,9 @@ fn default_vision_start_token_id() -> u32 {
 }
 fn default_vision_end_token_id() -> u32 {
     151653
+}
+fn default_eos_token_id() -> u32 {
+    151645
 }
 
 impl Qwen3VLConfig {
@@ -106,6 +111,7 @@ impl Qwen3VLConfig {
             video_token_id: 151656,
             vision_start_token_id: 151652,
             vision_end_token_id: 151653,
+            eos_token_id: 151645,
         }
     }
 }
@@ -145,8 +151,12 @@ pub struct Qwen3VL<B: Backend> {
     pub(crate) mrope: MRopeEmbedding<B>,
     pub(crate) caches: Vec<AttentionKvCache<B>>,
     pub(crate) config: Qwen3VLConfig,
+    pub(crate) eos_token_id: u32,
     pub(crate) max_seq_len: usize,
     pub(crate) device: Device<B>,
+    /// Pre-computed cos/sin for text-only decode (mRoPE → standard RoPE).
+    decode_cos: Tensor<B, 2>,
+    decode_sin: Tensor<B, 2>,
 }
 
 impl<B: Backend> Qwen3VL<B> {
@@ -208,20 +218,26 @@ impl<B: Backend> Qwen3VL<B> {
         let (transformer, vision_encoder) =
             load_vl_safetensors_weights(transformer, vision_encoder, model_dir, &config, device)?;
 
+        let (decode_cos, decode_sin) = mrope.precompute_text_tables(max_seq_len, device);
+
         let caches = (0..tc.num_hidden_layers)
             .map(|_| {
                 AttentionKvCache::new(1, tc.num_key_value_heads, max_seq_len, tc.head_dim, device)
             })
             .collect();
 
+        let eos_token_id = config.eos_token_id;
         Ok(Self {
             transformer,
             vision_encoder,
             mrope,
             caches,
             config,
+            eos_token_id,
             max_seq_len,
             device: device.clone(),
+            decode_cos,
+            decode_sin,
         })
     }
 
@@ -348,6 +364,7 @@ impl<B: Backend> Qwen3VL<B> {
             video_token_id: 151656,
             vision_start_token_id: 151652,
             vision_end_token_id: 151653,
+            eos_token_id: text_config_raw.eos_token_id,
         };
 
         // 7. Create text transformer skeleton
@@ -425,7 +442,10 @@ impl<B: Backend> Qwen3VL<B> {
             device,
         );
 
-        // 12. Create KV caches
+        // 12. Pre-compute text-only decode RoPE tables
+        let (decode_cos, decode_sin) = mrope.precompute_text_tables(max_seq_len, device);
+
+        // 13. Create KV caches
         let caches = (0..config.text_config.num_hidden_layers)
             .map(|_| {
                 AttentionKvCache::new(
@@ -438,14 +458,18 @@ impl<B: Backend> Qwen3VL<B> {
             })
             .collect();
 
+        let eos_token_id = config.eos_token_id;
         Ok(Self {
             transformer,
             vision_encoder,
             mrope,
             caches,
             config,
+            eos_token_id,
             max_seq_len,
             device: device.clone(),
+            decode_cos,
+            decode_sin,
         })
     }
 
@@ -465,7 +489,7 @@ impl<B: Backend> Qwen3VL<B> {
     /// - `callback`: streaming callback
     pub fn generate_with_vision(
         &mut self,
-        tokenizer: &Qwen3Tokenizer,
+        tokenizer: &tokenizers::Tokenizer,
         token_ids: &[u32],
         images: &[VisionInput],
         params: VLGenerationParams,
@@ -675,6 +699,7 @@ impl<B: Backend> Qwen3VL<B> {
             }
         }
 
+        let _ = B::sync(&self.device);
         let prefill_time = start_time.elapsed().as_secs_f64();
 
         if cancelled {
@@ -712,18 +737,19 @@ impl<B: Backend> Qwen3VL<B> {
         let logits_2d = last_logits_2d
             .ok_or_else(|| "prompt must not be empty (encoded to zero tokens)".to_string())?;
         let mut next_token = sample_token(&logits_2d, params.temperature, params.sampler);
-        let eos_token = tokenizer.eos_token_id();
-        let mut all_tokens: Vec<u32> = token_ids.to_vec();
-        all_tokens.push(next_token);
+        let eos_token = self.eos_token_id;
         let mut generated_count = 1;
+
+        // Accumulate decoded text incrementally to avoid re-decoding the entire
+        // generated sequence on every step (which is O(n²) in total).
+        let mut decoded_text = tokenizer.decode(&[next_token], true).unwrap_or_default();
 
         let stop_reason = if next_token == eos_token {
             StopReason::Eos
         } else {
-            let text = tokenizer.decode(&all_tokens[prompt_len..]);
             if callback(GenerationEvent::Token {
                 token_id: next_token,
-                text,
+                text: decoded_text.clone(),
                 tokens_generated: generated_count,
             })
             .is_break()
@@ -736,14 +762,13 @@ impl<B: Backend> Qwen3VL<B> {
                     stop_reason: StopReason::Cancelled,
                 });
                 return Ok(GenerationOutput {
-                    text: tokenizer.decode(&all_tokens[prompt_len..]),
+                    text: decoded_text,
                     tokens: generated_count,
                     time: elapsed,
                 });
             }
 
             // 9. Autoregressive decode
-            let mut pos = prompt_len;
             let mut text_pos = position_ids[0].last().copied().unwrap_or(0) + 1;
             let mut stop = StopReason::MaxTokens;
 
@@ -753,9 +778,11 @@ impl<B: Backend> Qwen3VL<B> {
                     Tensor::<B, 1, Int>::from_data(td, &self.device).unsqueeze::<2>();
                 let token_emb = self.transformer.embed_tokens().forward(token_tensor);
 
-                // Text-only decode: all 3 mRoPE dims identical
-                let decode_pos_ids = vec![vec![text_pos], vec![text_pos], vec![text_pos]];
-                let (cos, sin) = self.mrope.compute_cos_sin(&decode_pos_ids, &self.device);
+                // Slice from pre-computed table (mRoPE → standard RoPE for text-only decode)
+                #[allow(clippy::single_range_in_vec_init)]
+                let cos = self.decode_cos.clone().slice([text_pos..text_pos + 1]);
+                #[allow(clippy::single_range_in_vec_init)]
+                let sin = self.decode_sin.clone().slice([text_pos..text_pos + 1]);
 
                 let logits = self.transformer.forward_from_embeddings(
                     token_emb,
@@ -768,9 +795,7 @@ impl<B: Backend> Qwen3VL<B> {
 
                 let logits = logits.reshape([1, tc.vocab_size]);
                 next_token = sample_token(&logits, params.temperature, params.sampler);
-                all_tokens.push(next_token);
                 generated_count += 1;
-                pos += 1;
                 text_pos += 1;
 
                 if next_token == eos_token {
@@ -778,10 +803,10 @@ impl<B: Backend> Qwen3VL<B> {
                     break;
                 }
 
-                let text = tokenizer.decode(&all_tokens[prompt_len..]);
+                decoded_text.push_str(&tokenizer.decode(&[next_token], true).unwrap_or_default());
                 if callback(GenerationEvent::Token {
                     token_id: next_token,
-                    text,
+                    text: decoded_text.clone(),
                     tokens_generated: generated_count,
                 })
                 .is_break()
@@ -802,7 +827,7 @@ impl<B: Backend> Qwen3VL<B> {
         });
 
         Ok(GenerationOutput {
-            text: tokenizer.decode(&all_tokens[prompt_len..]),
+            text: decoded_text,
             tokens: generated_count,
             time: elapsed,
         })
@@ -880,16 +905,22 @@ fn load_gguf_vision_weights<B: Backend>(
 
     let make_1d = |data: Vec<f32>, device: &Device<B>| -> Tensor<B, 1> {
         let len = data.len();
-        Tensor::from_data(TensorData::new(data, [len]), device)
+        Tensor::from_data(make_tensor_data::<B>(data, vec![len]), device)
     };
 
     let make_2d = |data: Vec<f32>, shape: &[usize], device: &Device<B>| -> Tensor<B, 2> {
-        Tensor::from_data(TensorData::new(data, [shape[0], shape[1]]), device)
+        Tensor::from_data(
+            make_tensor_data::<B>(data, vec![shape[0], shape[1]]),
+            device,
+        )
     };
 
     // 2D linear weight: transpose [out, in] -> [in, out]
     let make_2d_linear = |data: Vec<f32>, shape: &[usize], device: &Device<B>| -> Tensor<B, 2> {
-        let t = Tensor::from_data(TensorData::new(data, [shape[0], shape[1]]), device);
+        let t = Tensor::from_data(
+            make_tensor_data::<B>(data, vec![shape[0], shape[1]]),
+            device,
+        );
         t.transpose()
     };
 
@@ -920,11 +951,17 @@ fn load_gguf_vision_weights<B: Backend>(
                 combined.extend_from_slice(&data1[start..start + slice_dim]);
             }
             let total_dim = 2 * slice_dim;
-            Tensor::<B, 1>::from_data(TensorData::new(combined, [out_dim * total_dim]), device)
-                .reshape([out_dim, total_dim])
+            Tensor::<B, 1>::from_data(
+                make_tensor_data::<B>(combined, vec![out_dim * total_dim]),
+                device,
+            )
+            .reshape([out_dim, total_dim])
         } else {
-            Tensor::<B, 1>::from_data(TensorData::new(data0, [out_dim * slice_dim]), device)
-                .reshape([out_dim, slice_dim])
+            Tensor::<B, 1>::from_data(
+                make_tensor_data::<B>(data0, vec![out_dim * slice_dim]),
+                device,
+            )
+            .reshape([out_dim, slice_dim])
         };
 
         let (bias_data, _) = read_tensor(file, "v.patch_embd.bias")?;
@@ -1107,9 +1144,9 @@ fn load_gguf_vision_weights<B: Backend>(
     Ok(vision_encoder)
 }
 
-type TensorMap = HashMap<String, (Vec<f32>, Vec<usize>)>;
+type TensorMap = HashMap<String, (WeightData, Vec<usize>)>;
 
-/// Remove a 1D tensor from the map.
+/// Remove a 1D tensor from the map, creating TensorData in the backend's native float type.
 fn take_tensor_1d<B: Backend>(
     map: &mut TensorMap,
     name: &str,
@@ -1119,10 +1156,13 @@ fn take_tensor_1d<B: Backend>(
         .remove(name)
         .ok_or_else(|| format!("Tensor '{}' not found", name))?;
     let len = data.len();
-    Ok(Tensor::from_data(TensorData::new(data, [len]), device))
+    Ok(Tensor::from_data(
+        data.into_tensor_data::<B>(vec![len]),
+        device,
+    ))
 }
 
-/// Remove a 2D tensor (no transpose).
+/// Remove a 2D tensor (no transpose), creating TensorData in the backend's native float type.
 fn take_tensor_2d<B: Backend>(
     map: &mut TensorMap,
     name: &str,
@@ -1131,10 +1171,7 @@ fn take_tensor_2d<B: Backend>(
     let (data, shape) = map
         .remove(name)
         .ok_or_else(|| format!("Tensor '{}' not found", name))?;
-    Ok(Tensor::from_data(
-        TensorData::new(data, [shape[0], shape[1]]),
-        device,
-    ))
+    Ok(Tensor::from_data(data.into_tensor_data::<B>(shape), device))
 }
 
 /// Remove a 2D Linear weight and transpose [out, in] -> [in, out].
@@ -1306,6 +1343,7 @@ fn load_vl_safetensors_weights<B: Backend>(
         .clone()
         .unwrap_or_default();
     let mut next_ds_merger: usize = 0;
+    let use_f16 = TypeId::of::<B::FloatElem>() == TypeId::of::<half::f16>();
 
     // Stream weights shard-by-shard: after reading each shard file, completed layers are
     // loaded into the model immediately and their f32 data is freed. This keeps peak memory
@@ -1323,27 +1361,57 @@ fn load_vl_safetensors_weights<B: Backend>(
                 let dtype = tensor_view.dtype();
                 let data = tensor_view.data();
 
-                let float_data: Vec<f32> = match dtype {
-                    safetensors::Dtype::F32 => data
-                        .chunks_exact(4)
-                        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-                        .collect(),
-                    safetensors::Dtype::F16 => data
-                        .chunks_exact(2)
-                        .map(|chunk| half::f16::from_le_bytes([chunk[0], chunk[1]]).to_f32())
-                        .collect(),
-                    safetensors::Dtype::BF16 => data
-                        .chunks_exact(2)
-                        .map(|chunk| half::bf16::from_le_bytes([chunk[0], chunk[1]]).to_f32())
-                        .collect(),
-                    safetensors::Dtype::F8_E4M3 => data
-                        .iter()
-                        .map(|&b| crate::model::fp8_e4m3_to_f32(b))
-                        .collect(),
-                    _ => continue,
+                // Load weights in the backend's native float type when possible.
+                // FP8 always goes through f32 for block-wise dequantization scaling.
+                let weight_data = if use_f16 && dtype != safetensors::Dtype::F8_E4M3 {
+                    let f16_data: Vec<half::f16> = match dtype {
+                        safetensors::Dtype::F16 => data
+                            .chunks_exact(2)
+                            .map(|c| half::f16::from_le_bytes([c[0], c[1]]))
+                            .collect(),
+                        safetensors::Dtype::BF16 => data
+                            .chunks_exact(2)
+                            .map(|c| {
+                                half::f16::from_f32(
+                                    half::bf16::from_le_bytes([c[0], c[1]]).to_f32(),
+                                )
+                            })
+                            .collect(),
+                        safetensors::Dtype::F32 => data
+                            .chunks_exact(4)
+                            .map(|c| {
+                                half::f16::from_f32(f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                            })
+                            .collect(),
+                        _ => continue,
+                    };
+                    WeightData::F16(f16_data)
+                } else {
+                    let f32_data: Vec<f32> = match dtype {
+                        safetensors::Dtype::F32 => data
+                            .chunks_exact(4)
+                            .map(|chunk| {
+                                f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])
+                            })
+                            .collect(),
+                        safetensors::Dtype::F16 => data
+                            .chunks_exact(2)
+                            .map(|chunk| half::f16::from_le_bytes([chunk[0], chunk[1]]).to_f32())
+                            .collect(),
+                        safetensors::Dtype::BF16 => data
+                            .chunks_exact(2)
+                            .map(|chunk| half::bf16::from_le_bytes([chunk[0], chunk[1]]).to_f32())
+                            .collect(),
+                        safetensors::Dtype::F8_E4M3 => data
+                            .iter()
+                            .map(|&b| crate::model::fp8_e4m3_to_f32(b))
+                            .collect(),
+                        _ => continue,
+                    };
+                    WeightData::F32(f32_data)
                 };
 
-                tensor_map.insert(name.to_string(), (float_data, shape));
+                tensor_map.insert(name.to_string(), (weight_data, shape));
             }
         }
 
@@ -1356,27 +1424,30 @@ fn load_vl_safetensors_weights<B: Backend>(
             .collect();
         for scale_key in scale_keys {
             let weight_key = scale_key.replace(".weight_scale_inv", ".weight");
-            let (scale_data, scale_shape) = match tensor_map.remove(&scale_key) {
+            let (scale_wd, scale_shape) = match tensor_map.remove(&scale_key) {
                 Some(v) => v,
                 None => continue,
             };
-            if let Some((weight_data, weight_shape)) = tensor_map.get_mut(&weight_key) {
-                debug_assert_eq!(scale_shape.len(), 2);
-                let block_rows = scale_shape[0];
-                let block_cols = scale_shape[1];
-                let rows = weight_shape[0];
-                let cols = weight_shape[1];
-                let brow_size = rows / block_rows;
-                let bcol_size = cols / block_cols;
-                for br in 0..block_rows {
-                    for bc in 0..block_cols {
-                        let scale = scale_data[br * block_cols + bc];
-                        let row_start = br * brow_size;
-                        let col_start = bc * bcol_size;
-                        for r in row_start..row_start + brow_size {
-                            let offset = r * cols + col_start;
-                            for v in &mut weight_data[offset..offset + bcol_size] {
-                                *v *= scale;
+            let scale_data = scale_wd.into_f32();
+            if let Some((weight_wd, weight_shape)) = tensor_map.get_mut(&weight_key) {
+                if let Some(weight_data) = weight_wd.as_f32_mut() {
+                    debug_assert_eq!(scale_shape.len(), 2);
+                    let block_rows = scale_shape[0];
+                    let block_cols = scale_shape[1];
+                    let rows = weight_shape[0];
+                    let cols = weight_shape[1];
+                    let brow_size = rows / block_rows;
+                    let bcol_size = cols / block_cols;
+                    for br in 0..block_rows {
+                        for bc in 0..block_cols {
+                            let scale = scale_data[br * block_cols + bc];
+                            let row_start = br * brow_size;
+                            let col_start = bc * bcol_size;
+                            for r in row_start..row_start + brow_size {
+                                let offset = r * cols + col_start;
+                                for v in &mut weight_data[offset..offset + bcol_size] {
+                                    *v *= scale;
+                                }
                             }
                         }
                     }
@@ -1418,7 +1489,9 @@ fn load_vl_safetensors_weights<B: Backend>(
             let (data, shape) = tensor_map.remove(patch_key).unwrap();
             let out_dim = shape[0];
             let in_dim: usize = shape[1..].iter().product();
-            let weight = Tensor::<B, 1>::from_floats(&data[..], device).reshape([out_dim, in_dim]);
+            let len = data.len();
+            let weight = Tensor::<B, 1>::from_data(data.into_tensor_data::<B>(vec![len]), device)
+                .reshape([out_dim, in_dim]);
             let bias = take_tensor_1d(&mut tensor_map, patch_bias_key, device)?;
             vision_encoder = vision_encoder.load_patch_embed(weight, bias);
         }

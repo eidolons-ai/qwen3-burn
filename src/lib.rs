@@ -26,3 +26,4 @@ pub mod bench_internals {
 }
 
 pub use model::QuantizationMode;
+pub use tokenizers::Tokenizer;

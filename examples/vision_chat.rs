@@ -124,8 +124,10 @@ fn run<B: burn::prelude::Backend>(args: Args, device: burn::prelude::Device<B>) 
     eprintln!("Model loaded in {:.1}s", load_start.elapsed().as_secs_f64());
 
     // Preprocess images
-    let mut processor = ImageProcessor::default();
-    processor.video_max_frames = args.video_max_frames;
+    let processor = ImageProcessor {
+        video_max_frames: args.video_max_frames,
+        ..Default::default()
+    };
     let mut image_inputs: Vec<VisionInput> = Vec::new();
 
     for img_path in &args.image {
@@ -311,9 +313,31 @@ fn main() {
         run::<Cuda<f16, i32>>(args, device);
     }
 
-    #[cfg(not(any(feature = "wgpu", feature = "ndarray", feature = "cuda")))]
+    #[cfg(feature = "mlx")]
     {
-        eprintln!("No backend feature enabled. Use --features wgpu, ndarray, or cuda.");
+        use burn_mlx::{MlxDevice, MlxHalf};
+        let device = MlxDevice::Gpu;
+        run::<MlxHalf>(args, device);
+    }
+
+    #[cfg(feature = "metal")]
+    {
+        use burn::backend::wgpu::WgpuDevice;
+        use burn::backend::Wgpu;
+        use burn::tensor::f16;
+        let device = WgpuDevice::default();
+        run::<Wgpu<f16, i32>>(args, device);
+    }
+
+    #[cfg(not(any(
+        feature = "wgpu",
+        feature = "ndarray",
+        feature = "cuda",
+        feature = "mlx",
+        feature = "metal"
+    )))]
+    {
+        eprintln!("No backend feature enabled. Use --features wgpu, ndarray, cuda, mlx, or metal.");
         std::process::exit(1);
     }
 }

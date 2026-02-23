@@ -1,3 +1,4 @@
+use std::any::TypeId;
 use std::collections::HashMap;
 use std::ops::ControlFlow;
 use std::path::Path;
@@ -9,7 +10,6 @@ use serde::Deserialize;
 
 use crate::gguf;
 use crate::sampling::Sampler;
-use crate::tokenizer::Qwen3Tokenizer;
 use crate::transformer::{
     build_causal_mask, AttentionKvCache, MoeConfig, RotaryEmbedding, Transformer,
 };
@@ -17,9 +17,12 @@ use crate::transformer::{
 /// Weight quantization mode applied after loading.
 ///
 /// Uses Burn's native `Quantizer` to store weights in packed quantized format
-/// (`PackedU32`) for real memory savings. Requires a GPU backend (WGPU, CUDA);
-/// the NdArray/CPU backend does not support `PackedU32` storage. A selective
+/// for real memory savings. Requires a GPU backend (WGPU, CUDA, or MLX);
+/// the NdArray/CPU backend does not support quantized storage. A selective
 /// wrapper skips 1D tensors (RMSNorm weights) and embedding weights.
+///
+/// On the MLX backend, quantization uses MLX's native `quantize`/`quantized_matmul`
+/// kernels which store weights in MLX's own packed format with per-group scales.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub enum QuantizationMode {
     /// Auto-detect from GGUF source (Q8_0→Int8, Q4_0→Int4); no quantization for SafeTensors.
@@ -66,6 +69,10 @@ pub struct Qwen3Config {
     pub norm_topk_prob: Option<bool>,
     #[serde(default)]
     pub mlp_only_layers: Option<Vec<usize>>,
+    #[serde(default = "default_bos_token_id")]
+    pub bos_token_id: u32,
+    #[serde(default = "default_eos_token_id")]
+    pub eos_token_id: u32,
 }
 
 fn default_rms_norm_eps() -> f64 {
@@ -76,6 +83,12 @@ fn default_rope_theta() -> f64 {
 }
 fn default_head_dim() -> usize {
     128
+}
+fn default_bos_token_id() -> u32 {
+    151643
+}
+fn default_eos_token_id() -> u32 {
+    151645
 }
 
 impl Qwen3Config {
@@ -132,6 +145,8 @@ impl Qwen3Config {
             decoder_sparse_step: None,
             norm_topk_prob: None,
             mlp_only_layers: None,
+            bos_token_id: 151643,
+            eos_token_id: 151645,
         }
     }
 
@@ -155,6 +170,8 @@ impl Qwen3Config {
             decoder_sparse_step: None,
             norm_topk_prob: None,
             mlp_only_layers: None,
+            bos_token_id: 151643,
+            eos_token_id: 151645,
         }
     }
 
@@ -178,6 +195,8 @@ impl Qwen3Config {
             decoder_sparse_step: None,
             norm_topk_prob: None,
             mlp_only_layers: None,
+            bos_token_id: 151643,
+            eos_token_id: 151645,
         }
     }
 
@@ -201,6 +220,8 @@ impl Qwen3Config {
             decoder_sparse_step: None,
             norm_topk_prob: None,
             mlp_only_layers: None,
+            bos_token_id: 151643,
+            eos_token_id: 151645,
         }
     }
 
@@ -224,6 +245,8 @@ impl Qwen3Config {
             decoder_sparse_step: Some(1),
             norm_topk_prob: Some(true),
             mlp_only_layers: Some(vec![]),
+            bos_token_id: 151643,
+            eos_token_id: 151645,
         }
     }
 
@@ -247,6 +270,8 @@ impl Qwen3Config {
             decoder_sparse_step: Some(1),
             norm_topk_prob: Some(true),
             mlp_only_layers: Some(vec![]),
+            bos_token_id: 151643,
+            eos_token_id: 151645,
         }
     }
 }
@@ -305,6 +330,7 @@ pub struct Qwen3<B: Backend> {
     rope: RotaryEmbedding<B>,
     caches: Vec<AttentionKvCache<B>>,
     config: Qwen3Config,
+    eos_token_id: u32,
     max_seq_len: usize,
     device: Device<B>,
 }
@@ -375,11 +401,13 @@ impl<B: Backend> Qwen3<B> {
             })
             .collect();
 
+        let eos_token_id = config.eos_token_id;
         Ok(Self {
             transformer,
             rope,
             caches,
             config,
+            eos_token_id,
             max_seq_len,
             device: device.clone(),
         })
@@ -505,11 +533,13 @@ impl<B: Backend> Qwen3<B> {
             })
             .collect();
 
+        let eos_token_id = config.eos_token_id;
         Ok(Self {
             transformer,
             rope,
             caches,
             config,
+            eos_token_id,
             max_seq_len,
             device: device.clone(),
         })
@@ -525,7 +555,7 @@ impl<B: Backend> Qwen3<B> {
     /// Generate text from a prompt.
     pub fn generate(
         &mut self,
-        tokenizer: &Qwen3Tokenizer,
+        tokenizer: &tokenizers::Tokenizer,
         prompt: &str,
         max_new_tokens: usize,
         temperature: f64,
@@ -552,13 +582,17 @@ impl<B: Backend> Qwen3<B> {
     /// Returns an error if the prompt exceeds the model's `max_seq_len`.
     pub fn generate_streaming(
         &mut self,
-        tokenizer: &Qwen3Tokenizer,
+        tokenizer: &tokenizers::Tokenizer,
         params: GenerationParams,
         mut callback: impl FnMut(GenerationEvent) -> ControlFlow<()>,
     ) -> Result<GenerationOutput, String> {
         self.reset_caches();
 
-        let tokens = tokenizer.encode(params.prompt);
+        let tokens = tokenizer
+            .encode(params.prompt, false)
+            .map_err(|e| format!("Tokenization failed: {}", e))?
+            .get_ids()
+            .to_vec();
         let prompt_len = tokens.len();
 
         if prompt_len > self.max_seq_len {
@@ -568,7 +602,7 @@ impl<B: Backend> Qwen3<B> {
             ));
         }
         let mut all_tokens = tokens.clone();
-        let eos_token = tokenizer.eos_token_id();
+        let eos_token = self.eos_token_id;
 
         let start_time = Instant::now();
         let mut generated_count = 0;
@@ -617,6 +651,7 @@ impl<B: Backend> Qwen3<B> {
             }
         }
 
+        let _ = B::sync(&self.device);
         let prefill_time = start_time.elapsed().as_secs_f64();
 
         if cancelled {
@@ -659,7 +694,9 @@ impl<B: Backend> Qwen3<B> {
 
         // Accumulate decoded text incrementally to avoid re-decoding the entire
         // generated sequence on every step (which is O(n²) in total).
-        let mut decoded_text = tokenizer.decode(&[next_token]);
+        let mut decoded_text = tokenizer
+            .decode(&[next_token], true)
+            .map_err(|e| format!("Decode failed: {}", e))?;
 
         let stop_reason = if next_token == eos_token {
             StopReason::Eos
@@ -711,7 +748,11 @@ impl<B: Backend> Qwen3<B> {
                     break;
                 }
 
-                decoded_text.push_str(&tokenizer.decode(&[next_token]));
+                decoded_text.push_str(
+                    &tokenizer
+                        .decode(&[next_token], true)
+                        .map_err(|e| format!("Decode failed: {}", e))?,
+                );
                 if callback(GenerationEvent::Token {
                     token_id: next_token,
                     text: decoded_text.clone(),
@@ -769,7 +810,76 @@ fn sample_token<B: Backend>(logits: &Tensor<B, 2>, temperature: f64, sampler: &m
     sampler.sample_probs(&probs)
 }
 
-type TensorMap = HashMap<String, (Vec<f32>, Vec<usize>)>;
+/// Weight data stored in the backend's native float type to avoid unnecessary conversions.
+///
+/// When the backend uses f16 (e.g. Wgpu<f16>), safetensors weights are loaded directly
+/// as f16. FP8 weights always use f32 for block-wise dequantization scaling.
+pub(crate) enum WeightData {
+    F32(Vec<f32>),
+    F16(Vec<half::f16>),
+}
+
+impl WeightData {
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            Self::F32(v) => v.len(),
+            Self::F16(v) => v.len(),
+        }
+    }
+
+    /// Extract as mutable f32 vec (for FP8 block scaling).
+    pub(crate) fn as_f32_mut(&mut self) -> Option<&mut Vec<f32>> {
+        match self {
+            Self::F32(v) => Some(v),
+            Self::F16(_) => None,
+        }
+    }
+
+    /// Convert to f32 vec, consuming self.
+    pub(crate) fn into_f32(self) -> Vec<f32> {
+        match self {
+            Self::F32(v) => v,
+            Self::F16(v) => v.into_iter().map(|x| x.to_f32()).collect(),
+        }
+    }
+
+    /// Convert to TensorData in the backend's native float type.
+    pub(crate) fn into_tensor_data<B: Backend>(self, shape: Vec<usize>) -> TensorData {
+        let is_f16 = TypeId::of::<B::FloatElem>() == TypeId::of::<half::f16>();
+        if is_f16 {
+            match self {
+                Self::F16(v) => TensorData::new(v, shape),
+                Self::F32(v) => {
+                    let v: Vec<half::f16> = v.into_iter().map(half::f16::from_f32).collect();
+                    TensorData::new(v, shape)
+                }
+            }
+        } else {
+            match self {
+                Self::F32(v) => TensorData::new(v, shape),
+                Self::F16(v) => {
+                    let v: Vec<f32> = v.into_iter().map(|x| x.to_f32()).collect();
+                    TensorData::new(v, shape)
+                }
+            }
+        }
+    }
+}
+
+type TensorMap = HashMap<String, (WeightData, Vec<usize>)>;
+
+/// Create TensorData in the backend's native float type from f32 data.
+///
+/// When B::FloatElem is f16, converts f32 -> f16 on CPU to avoid backend-side conversion
+/// and halve the CPU->GPU transfer size.
+pub(crate) fn make_tensor_data<B: Backend>(data: Vec<f32>, shape: Vec<usize>) -> TensorData {
+    if TypeId::of::<B::FloatElem>() == TypeId::of::<half::f16>() {
+        let f16_data: Vec<half::f16> = data.into_iter().map(half::f16::from_f32).collect();
+        TensorData::new(f16_data, shape)
+    } else {
+        TensorData::new(data, shape)
+    }
+}
 
 /// Convert a single FP8 E4M3FN byte to f32.
 /// Format: 1 sign, 4 exponent (bias=7), 3 mantissa. No infinities; 0x7F/0xFF are NaN.
@@ -800,7 +910,7 @@ pub(crate) fn fp8_e4m3_to_f32(b: u8) -> f32 {
     f32::from_bits(bits)
 }
 
-/// Remove a 1D tensor from the map, consuming the f32 data (no clone).
+/// Remove a 1D tensor from the map, creating TensorData in the backend's native float type.
 fn take_tensor_1d<B: Backend>(
     map: &mut TensorMap,
     name: &str,
@@ -810,10 +920,13 @@ fn take_tensor_1d<B: Backend>(
         .remove(name)
         .ok_or_else(|| format!("Tensor '{}' not found in safetensors", name))?;
     let len = data.len();
-    Ok(Tensor::from_data(TensorData::new(data, [len]), device))
+    Ok(Tensor::from_data(
+        data.into_tensor_data::<B>(vec![len]),
+        device,
+    ))
 }
 
-/// Remove a 2D tensor from the map (no transpose), consuming the f32 data.
+/// Remove a 2D tensor from the map (no transpose), creating TensorData in the backend's native float type.
 fn take_tensor_2d<B: Backend>(
     map: &mut TensorMap,
     name: &str,
@@ -829,10 +942,7 @@ fn take_tensor_2d<B: Backend>(
         name,
         shape
     );
-    Ok(Tensor::from_data(
-        TensorData::new(data, [shape[0], shape[1]]),
-        device,
-    ))
+    Ok(Tensor::from_data(data.into_tensor_data::<B>(shape), device))
 }
 
 /// Remove a 2D Linear weight and transpose from PyTorch [out, in] to Burn [in, out].
@@ -1021,6 +1131,7 @@ fn load_safetensors_weights<B: Backend>(
     let mut next_layer: usize = 0;
     let mut embed_loaded = false;
     let mut lm_head_weight: Option<Tensor<B, 2>> = None;
+    let use_f16 = TypeId::of::<B::FloatElem>() == TypeId::of::<half::f16>();
 
     for (shard_idx, path) in st_files.iter().enumerate() {
         eprintln!("Reading shard {}/{}...", shard_idx + 1, st_files.len());
@@ -1038,30 +1149,68 @@ fn load_safetensors_weights<B: Backend>(
                 let dtype = tensor_view.dtype();
                 let data = tensor_view.data();
 
-                let float_data: Vec<f32> = match dtype {
-                    safetensors::Dtype::F32 => data
-                        .chunks_exact(4)
-                        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-                        .collect(),
-                    safetensors::Dtype::F16 => data
-                        .chunks_exact(2)
-                        .map(|chunk| half::f16::from_le_bytes([chunk[0], chunk[1]]).to_f32())
-                        .collect(),
-                    safetensors::Dtype::BF16 => data
-                        .chunks_exact(2)
-                        .map(|chunk| half::bf16::from_le_bytes([chunk[0], chunk[1]]).to_f32())
-                        .collect(),
-                    safetensors::Dtype::F8_E4M3 => {
-                        data.iter().map(|&b| fp8_e4m3_to_f32(b)).collect()
-                    }
-                    _ => {
-                        return Err(
-                            format!("Unsupported dtype {:?} for tensor {}", dtype, name).into()
-                        )
-                    }
+                // Load weights in the backend's native float type when possible.
+                // FP8 always goes through f32 for block-wise dequantization scaling.
+                let weight_data = if use_f16 && dtype != safetensors::Dtype::F8_E4M3 {
+                    let f16_data: Vec<half::f16> = match dtype {
+                        safetensors::Dtype::F16 => data
+                            .chunks_exact(2)
+                            .map(|c| half::f16::from_le_bytes([c[0], c[1]]))
+                            .collect(),
+                        safetensors::Dtype::BF16 => data
+                            .chunks_exact(2)
+                            .map(|c| {
+                                half::f16::from_f32(
+                                    half::bf16::from_le_bytes([c[0], c[1]]).to_f32(),
+                                )
+                            })
+                            .collect(),
+                        safetensors::Dtype::F32 => data
+                            .chunks_exact(4)
+                            .map(|c| {
+                                half::f16::from_f32(f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                            })
+                            .collect(),
+                        _ => {
+                            return Err(format!(
+                                "Unsupported dtype {:?} for tensor {}",
+                                dtype, name
+                            )
+                            .into())
+                        }
+                    };
+                    WeightData::F16(f16_data)
+                } else {
+                    let f32_data: Vec<f32> = match dtype {
+                        safetensors::Dtype::F32 => data
+                            .chunks_exact(4)
+                            .map(|chunk| {
+                                f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])
+                            })
+                            .collect(),
+                        safetensors::Dtype::F16 => data
+                            .chunks_exact(2)
+                            .map(|chunk| half::f16::from_le_bytes([chunk[0], chunk[1]]).to_f32())
+                            .collect(),
+                        safetensors::Dtype::BF16 => data
+                            .chunks_exact(2)
+                            .map(|chunk| half::bf16::from_le_bytes([chunk[0], chunk[1]]).to_f32())
+                            .collect(),
+                        safetensors::Dtype::F8_E4M3 => {
+                            data.iter().map(|&b| fp8_e4m3_to_f32(b)).collect()
+                        }
+                        _ => {
+                            return Err(format!(
+                                "Unsupported dtype {:?} for tensor {}",
+                                dtype, name
+                            )
+                            .into())
+                        }
+                    };
+                    WeightData::F32(f32_data)
                 };
 
-                tensor_map.insert(name.to_string(), (float_data, shape));
+                tensor_map.insert(name.to_string(), (weight_data, shape));
             }
         }
 
@@ -1074,27 +1223,30 @@ fn load_safetensors_weights<B: Backend>(
             .collect();
         for scale_key in scale_keys {
             let weight_key = scale_key.replace(".weight_scale_inv", ".weight");
-            let (scale_data, scale_shape) = match tensor_map.remove(&scale_key) {
+            let (scale_wd, scale_shape) = match tensor_map.remove(&scale_key) {
                 Some(v) => v,
                 None => continue,
             };
-            if let Some((weight_data, weight_shape)) = tensor_map.get_mut(&weight_key) {
-                debug_assert_eq!(scale_shape.len(), 2);
-                let block_rows = scale_shape[0];
-                let block_cols = scale_shape[1];
-                let rows = weight_shape[0];
-                let cols = weight_shape[1];
-                let brow_size = rows / block_rows;
-                let bcol_size = cols / block_cols;
-                for br in 0..block_rows {
-                    for bc in 0..block_cols {
-                        let scale = scale_data[br * block_cols + bc];
-                        let row_start = br * brow_size;
-                        let col_start = bc * bcol_size;
-                        for r in row_start..row_start + brow_size {
-                            let offset = r * cols + col_start;
-                            for v in &mut weight_data[offset..offset + bcol_size] {
-                                *v *= scale;
+            let scale_data = scale_wd.into_f32();
+            if let Some((weight_wd, weight_shape)) = tensor_map.get_mut(&weight_key) {
+                if let Some(weight_data) = weight_wd.as_f32_mut() {
+                    debug_assert_eq!(scale_shape.len(), 2);
+                    let block_rows = scale_shape[0];
+                    let block_cols = scale_shape[1];
+                    let rows = weight_shape[0];
+                    let cols = weight_shape[1];
+                    let brow_size = rows / block_rows;
+                    let bcol_size = cols / block_cols;
+                    for br in 0..block_rows {
+                        for bc in 0..block_cols {
+                            let scale = scale_data[br * block_cols + bc];
+                            let row_start = br * brow_size;
+                            let col_start = bc * bcol_size;
+                            for r in row_start..row_start + brow_size {
+                                let offset = r * cols + col_start;
+                                for v in &mut weight_data[offset..offset + bcol_size] {
+                                    *v *= scale;
+                                }
                             }
                         }
                     }
@@ -1271,15 +1423,18 @@ pub(crate) fn load_gguf_weights<B: Backend>(
         Ok((data, shape))
     };
 
-    // Helper: create a 1D Burn tensor
+    // Helper: create a 1D Burn tensor in the backend's native float type
     let make_1d = |data: Vec<f32>, device: &Device<B>| -> Tensor<B, 1> {
         let len = data.len();
-        Tensor::from_data(TensorData::new(data, [len]), device)
+        Tensor::from_data(make_tensor_data::<B>(data, vec![len]), device)
     };
 
-    // Helper: create a 2D Burn tensor
+    // Helper: create a 2D Burn tensor in the backend's native float type
     let make_2d = |data: Vec<f32>, shape: &[usize], device: &Device<B>| -> Tensor<B, 2> {
-        Tensor::from_data(TensorData::new(data, [shape[0], shape[1]]), device)
+        Tensor::from_data(
+            make_tensor_data::<B>(data, vec![shape[0], shape[1]]),
+            device,
+        )
     };
 
     // Helper: create a 2D linear weight tensor (transposed), quantized if scheme is set.
@@ -1288,15 +1443,18 @@ pub(crate) fn load_gguf_weights<B: Backend>(
         if let Some(ref scheme) = quant_scheme {
             make_2d_quantized(data, shape, scheme, device)
         } else {
-            let t = Tensor::from_data(TensorData::new(data, [shape[0], shape[1]]), device);
+            let t = Tensor::from_data(
+                make_tensor_data::<B>(data, vec![shape[0], shape[1]]),
+                device,
+            );
             t.transpose()
         }
     };
 
-    // Helper: create a 3D Burn tensor
+    // Helper: create a 3D Burn tensor in the backend's native float type
     let make_3d = |data: Vec<f32>, shape: &[usize], device: &Device<B>| -> Tensor<B, 3> {
         Tensor::from_data(
-            TensorData::new(data, [shape[0], shape[1], shape[2]]),
+            make_tensor_data::<B>(data, vec![shape[0], shape[1], shape[2]]),
             device,
         )
     };
@@ -1471,10 +1629,18 @@ impl<B: Backend> burn::module::ModuleMapper<B> for SelectiveQuantizer {
         // non-contiguous memory which causes Burn's quantization to produce
         // catastrophically wrong scales. Round-tripping through TensorData
         // forces a contiguous copy.
-        let tensor = param.val();
-        let data = tensor.to_data();
-        let contiguous = Tensor::from_data(data, &tensor.device());
-        let param = burn::module::Param::from_tensor(contiguous);
+        //
+        // This workaround is skipped for the MLX backend: MLX's as_slice()
+        // does not respect strides, so the round-trip corrupts transposed
+        // tensors. MLX's native quantize kernel handles non-contiguous inputs
+        // correctly, making the workaround unnecessary.
+        #[cfg(not(feature = "mlx"))]
+        let param = {
+            let tensor = param.val();
+            let data = tensor.to_data();
+            let contiguous = Tensor::from_data(data, &tensor.device());
+            burn::module::Param::from_tensor(contiguous)
+        };
 
         self.quantizer.map_float(param)
     }
@@ -1482,9 +1648,8 @@ impl<B: Backend> burn::module::ModuleMapper<B> for SelectiveQuantizer {
 
 /// Apply quantization to the transformer model using Burn's native quantization.
 ///
-/// Weights are stored in quantized format with `PackedU32` storage for real
-/// memory savings on GPU backends (WGPU, CUDA). NdArray does not support
-/// `PackedU32`; quantization requires a GPU backend.
+/// Weights are stored in quantized format for real memory savings on GPU
+/// backends (WGPU, CUDA, MLX). NdArray does not support quantized storage.
 pub(crate) fn apply_quantization<B: Backend>(
     transformer: Transformer<B>,
     mode: QuantizationMode,
