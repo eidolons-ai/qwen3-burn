@@ -18,9 +18,12 @@ use crate::transformer::{
 /// Weight quantization mode applied after loading.
 ///
 /// Uses Burn's native `Quantizer` to store weights in packed quantized format
-/// (`PackedU32`) for real memory savings. Requires a GPU backend (WGPU, CUDA);
-/// the NdArray/CPU backend does not support `PackedU32` storage. A selective
+/// for real memory savings. Requires a GPU backend (WGPU, CUDA, or MLX);
+/// the NdArray/CPU backend does not support quantized storage. A selective
 /// wrapper skips 1D tensors (RMSNorm weights) and embedding weights.
+///
+/// On the MLX backend, quantization uses MLX's native `quantize`/`quantized_matmul`
+/// kernels which store weights in MLX's own packed format with per-group scales.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub enum QuantizationMode {
     /// Auto-detect from GGUF source (Q8_0→Int8, Q4_0→Int4); no quantization for SafeTensors.
@@ -1590,10 +1593,18 @@ impl<B: Backend> burn::module::ModuleMapper<B> for SelectiveQuantizer {
         // non-contiguous memory which causes Burn's quantization to produce
         // catastrophically wrong scales. Round-tripping through TensorData
         // forces a contiguous copy.
-        let tensor = param.val();
-        let data = tensor.to_data();
-        let contiguous = Tensor::from_data(data, &tensor.device());
-        let param = burn::module::Param::from_tensor(contiguous);
+        //
+        // This workaround is skipped for the MLX backend: MLX's as_slice()
+        // does not respect strides, so the round-trip corrupts transposed
+        // tensors. MLX's native quantize kernel handles non-contiguous inputs
+        // correctly, making the workaround unnecessary.
+        #[cfg(not(feature = "mlx"))]
+        let param = {
+            let tensor = param.val();
+            let data = tensor.to_data();
+            let contiguous = Tensor::from_data(data, &tensor.device());
+            burn::module::Param::from_tensor(contiguous)
+        };
 
         self.quantizer.map_float(param)
     }
@@ -1601,9 +1612,8 @@ impl<B: Backend> burn::module::ModuleMapper<B> for SelectiveQuantizer {
 
 /// Apply quantization to the transformer model using Burn's native quantization.
 ///
-/// Weights are stored in quantized format with `PackedU32` storage for real
-/// memory savings on GPU backends (WGPU, CUDA). NdArray does not support
-/// `PackedU32`; quantization requires a GPU backend.
+/// Weights are stored in quantized format for real memory savings on GPU
+/// backends (WGPU, CUDA, MLX). NdArray does not support quantized storage.
 pub(crate) fn apply_quantization<B: Backend>(
     transformer: Transformer<B>,
     mode: QuantizationMode,
