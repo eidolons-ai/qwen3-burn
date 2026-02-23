@@ -15,7 +15,6 @@ use crate::model::{
 };
 use crate::mrope::{self, MRopeEmbedding};
 use crate::sampling::Sampler;
-use crate::tokenizer::Qwen3Tokenizer;
 use crate::transformer::{build_causal_mask, AttentionKvCache, Transformer};
 use crate::vision::{VisionConfig, VisionEncoder};
 
@@ -63,6 +62,8 @@ pub struct Qwen3VLConfig {
     pub vision_start_token_id: u32,
     #[serde(default = "default_vision_end_token_id")]
     pub vision_end_token_id: u32,
+    #[serde(default = "default_eos_token_id")]
+    pub eos_token_id: u32,
 }
 
 fn default_image_token_id() -> u32 {
@@ -76,6 +77,9 @@ fn default_vision_start_token_id() -> u32 {
 }
 fn default_vision_end_token_id() -> u32 {
     151653
+}
+fn default_eos_token_id() -> u32 {
+    151645
 }
 
 impl Qwen3VLConfig {
@@ -107,6 +111,7 @@ impl Qwen3VLConfig {
             video_token_id: 151656,
             vision_start_token_id: 151652,
             vision_end_token_id: 151653,
+            eos_token_id: 151645,
         }
     }
 }
@@ -146,6 +151,7 @@ pub struct Qwen3VL<B: Backend> {
     pub(crate) mrope: MRopeEmbedding<B>,
     pub(crate) caches: Vec<AttentionKvCache<B>>,
     pub(crate) config: Qwen3VLConfig,
+    pub(crate) eos_token_id: u32,
     pub(crate) max_seq_len: usize,
     pub(crate) device: Device<B>,
 }
@@ -215,12 +221,14 @@ impl<B: Backend> Qwen3VL<B> {
             })
             .collect();
 
+        let eos_token_id = config.eos_token_id;
         Ok(Self {
             transformer,
             vision_encoder,
             mrope,
             caches,
             config,
+            eos_token_id,
             max_seq_len,
             device: device.clone(),
         })
@@ -349,6 +357,7 @@ impl<B: Backend> Qwen3VL<B> {
             video_token_id: 151656,
             vision_start_token_id: 151652,
             vision_end_token_id: 151653,
+            eos_token_id: text_config_raw.eos_token_id,
         };
 
         // 7. Create text transformer skeleton
@@ -439,12 +448,14 @@ impl<B: Backend> Qwen3VL<B> {
             })
             .collect();
 
+        let eos_token_id = config.eos_token_id;
         Ok(Self {
             transformer,
             vision_encoder,
             mrope,
             caches,
             config,
+            eos_token_id,
             max_seq_len,
             device: device.clone(),
         })
@@ -466,7 +477,7 @@ impl<B: Backend> Qwen3VL<B> {
     /// - `callback`: streaming callback
     pub fn generate_with_vision(
         &mut self,
-        tokenizer: &Qwen3Tokenizer,
+        tokenizer: &tokenizers::Tokenizer,
         token_ids: &[u32],
         images: &[VisionInput],
         params: VLGenerationParams,
@@ -714,7 +725,7 @@ impl<B: Backend> Qwen3VL<B> {
         let logits_2d = last_logits_2d
             .ok_or_else(|| "prompt must not be empty (encoded to zero tokens)".to_string())?;
         let mut next_token = sample_token(&logits_2d, params.temperature, params.sampler);
-        let eos_token = tokenizer.eos_token_id();
+        let eos_token = self.eos_token_id;
         let mut all_tokens: Vec<u32> = token_ids.to_vec();
         all_tokens.push(next_token);
         let mut generated_count = 1;
@@ -722,7 +733,9 @@ impl<B: Backend> Qwen3VL<B> {
         let stop_reason = if next_token == eos_token {
             StopReason::Eos
         } else {
-            let text = tokenizer.decode(&all_tokens[prompt_len..]);
+            let text = tokenizer
+                .decode(&all_tokens[prompt_len..], true)
+                .unwrap_or_default();
             if callback(GenerationEvent::Token {
                 token_id: next_token,
                 text,
@@ -738,7 +751,9 @@ impl<B: Backend> Qwen3VL<B> {
                     stop_reason: StopReason::Cancelled,
                 });
                 return Ok(GenerationOutput {
-                    text: tokenizer.decode(&all_tokens[prompt_len..]),
+                    text: tokenizer
+                        .decode(&all_tokens[prompt_len..], true)
+                        .unwrap_or_default(),
                     tokens: generated_count,
                     time: elapsed,
                 });
@@ -780,7 +795,9 @@ impl<B: Backend> Qwen3VL<B> {
                     break;
                 }
 
-                let text = tokenizer.decode(&all_tokens[prompt_len..]);
+                let text = tokenizer
+                    .decode(&all_tokens[prompt_len..], true)
+                    .unwrap_or_default();
                 if callback(GenerationEvent::Token {
                     token_id: next_token,
                     text,
@@ -804,7 +821,9 @@ impl<B: Backend> Qwen3VL<B> {
         });
 
         Ok(GenerationOutput {
-            text: tokenizer.decode(&all_tokens[prompt_len..]),
+            text: tokenizer
+                .decode(&all_tokens[prompt_len..], true)
+                .unwrap_or_default(),
             tokens: generated_count,
             time: elapsed,
         })

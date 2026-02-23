@@ -10,7 +10,6 @@ use serde::Deserialize;
 
 use crate::gguf;
 use crate::sampling::Sampler;
-use crate::tokenizer::Qwen3Tokenizer;
 use crate::transformer::{
     build_causal_mask, AttentionKvCache, MoeConfig, RotaryEmbedding, Transformer,
 };
@@ -70,6 +69,10 @@ pub struct Qwen3Config {
     pub norm_topk_prob: Option<bool>,
     #[serde(default)]
     pub mlp_only_layers: Option<Vec<usize>>,
+    #[serde(default = "default_bos_token_id")]
+    pub bos_token_id: u32,
+    #[serde(default = "default_eos_token_id")]
+    pub eos_token_id: u32,
 }
 
 fn default_rms_norm_eps() -> f64 {
@@ -80,6 +83,12 @@ fn default_rope_theta() -> f64 {
 }
 fn default_head_dim() -> usize {
     128
+}
+fn default_bos_token_id() -> u32 {
+    151643
+}
+fn default_eos_token_id() -> u32 {
+    151645
 }
 
 impl Qwen3Config {
@@ -136,6 +145,8 @@ impl Qwen3Config {
             decoder_sparse_step: None,
             norm_topk_prob: None,
             mlp_only_layers: None,
+            bos_token_id: 151643,
+            eos_token_id: 151645,
         }
     }
 
@@ -159,6 +170,8 @@ impl Qwen3Config {
             decoder_sparse_step: None,
             norm_topk_prob: None,
             mlp_only_layers: None,
+            bos_token_id: 151643,
+            eos_token_id: 151645,
         }
     }
 
@@ -182,6 +195,8 @@ impl Qwen3Config {
             decoder_sparse_step: None,
             norm_topk_prob: None,
             mlp_only_layers: None,
+            bos_token_id: 151643,
+            eos_token_id: 151645,
         }
     }
 
@@ -205,6 +220,8 @@ impl Qwen3Config {
             decoder_sparse_step: None,
             norm_topk_prob: None,
             mlp_only_layers: None,
+            bos_token_id: 151643,
+            eos_token_id: 151645,
         }
     }
 
@@ -228,6 +245,8 @@ impl Qwen3Config {
             decoder_sparse_step: Some(1),
             norm_topk_prob: Some(true),
             mlp_only_layers: Some(vec![]),
+            bos_token_id: 151643,
+            eos_token_id: 151645,
         }
     }
 
@@ -251,6 +270,8 @@ impl Qwen3Config {
             decoder_sparse_step: Some(1),
             norm_topk_prob: Some(true),
             mlp_only_layers: Some(vec![]),
+            bos_token_id: 151643,
+            eos_token_id: 151645,
         }
     }
 }
@@ -309,6 +330,7 @@ pub struct Qwen3<B: Backend> {
     rope: RotaryEmbedding<B>,
     caches: Vec<AttentionKvCache<B>>,
     config: Qwen3Config,
+    eos_token_id: u32,
     max_seq_len: usize,
     device: Device<B>,
 }
@@ -379,11 +401,13 @@ impl<B: Backend> Qwen3<B> {
             })
             .collect();
 
+        let eos_token_id = config.eos_token_id;
         Ok(Self {
             transformer,
             rope,
             caches,
             config,
+            eos_token_id,
             max_seq_len,
             device: device.clone(),
         })
@@ -509,11 +533,13 @@ impl<B: Backend> Qwen3<B> {
             })
             .collect();
 
+        let eos_token_id = config.eos_token_id;
         Ok(Self {
             transformer,
             rope,
             caches,
             config,
+            eos_token_id,
             max_seq_len,
             device: device.clone(),
         })
@@ -529,7 +555,7 @@ impl<B: Backend> Qwen3<B> {
     /// Generate text from a prompt.
     pub fn generate(
         &mut self,
-        tokenizer: &Qwen3Tokenizer,
+        tokenizer: &tokenizers::Tokenizer,
         prompt: &str,
         max_new_tokens: usize,
         temperature: f64,
@@ -556,13 +582,17 @@ impl<B: Backend> Qwen3<B> {
     /// Returns an error if the prompt exceeds the model's `max_seq_len`.
     pub fn generate_streaming(
         &mut self,
-        tokenizer: &Qwen3Tokenizer,
+        tokenizer: &tokenizers::Tokenizer,
         params: GenerationParams,
         mut callback: impl FnMut(GenerationEvent) -> ControlFlow<()>,
     ) -> Result<GenerationOutput, String> {
         self.reset_caches();
 
-        let tokens = tokenizer.encode(params.prompt);
+        let tokens = tokenizer
+            .encode(params.prompt, false)
+            .map_err(|e| format!("Tokenization failed: {}", e))?
+            .get_ids()
+            .to_vec();
         let prompt_len = tokens.len();
 
         if prompt_len > self.max_seq_len {
@@ -572,7 +602,7 @@ impl<B: Backend> Qwen3<B> {
             ));
         }
         let mut all_tokens = tokens.clone();
-        let eos_token = tokenizer.eos_token_id();
+        let eos_token = self.eos_token_id;
 
         let start_time = Instant::now();
         let mut generated_count = 0;
@@ -664,7 +694,9 @@ impl<B: Backend> Qwen3<B> {
 
         // Accumulate decoded text incrementally to avoid re-decoding the entire
         // generated sequence on every step (which is O(n²) in total).
-        let mut decoded_text = tokenizer.decode(&[next_token]);
+        let mut decoded_text = tokenizer
+            .decode(&[next_token], true)
+            .map_err(|e| format!("Decode failed: {}", e))?;
 
         let stop_reason = if next_token == eos_token {
             StopReason::Eos
@@ -716,7 +748,11 @@ impl<B: Backend> Qwen3<B> {
                     break;
                 }
 
-                decoded_text.push_str(&tokenizer.decode(&[next_token]));
+                decoded_text.push_str(
+                    &tokenizer
+                        .decode(&[next_token], true)
+                        .map_err(|e| format!("Decode failed: {}", e))?,
+                );
                 if callback(GenerationEvent::Token {
                     token_id: next_token,
                     text: decoded_text.clone(),

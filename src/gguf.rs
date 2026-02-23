@@ -894,6 +894,16 @@ pub(crate) fn extract_config(gguf: &GgufFile) -> Result<Qwen3Config, Box<dyn std
         None
     };
 
+    // BOS/EOS token IDs from GGUF metadata (standard keys used by llama.cpp)
+    let bos_token_id = md
+        .get("tokenizer.ggml.bos_token_id")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(151643) as u32;
+    let eos_token_id = md
+        .get("tokenizer.ggml.eos_token_id")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(151645) as u32;
+
     Ok(Qwen3Config {
         hidden_size,
         num_hidden_layers,
@@ -912,6 +922,8 @@ pub(crate) fn extract_config(gguf: &GgufFile) -> Result<Qwen3Config, Box<dyn std
         decoder_sparse_step,
         norm_topk_prob,
         mlp_only_layers,
+        bos_token_id,
+        eos_token_id,
     })
 }
 
