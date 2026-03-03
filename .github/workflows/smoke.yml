@@ -36,7 +36,7 @@ jobs:
           curl -fSL "$HF_BASE/Qwen/Qwen3-0.6B-GGUF/resolve/main/$GGUF_FILE" -o "$MODEL_DIR/$GGUF_FILE"
           curl -fSL "$HF_BASE/Qwen/Qwen3-0.6B/resolve/main/tokenizer.json" -o "$MODEL_DIR/tokenizer.json"
 
-      - uses: actions-rust-lang/setup-rust-toolchain@1780873c7b576612439a134613cc4cc74ce5538c # v1.15.2
+      - uses: actions-rust-lang/setup-rust-toolchain@a0b538fa0b742a6aa35d6e2c169b4bd06d225a98 # v1.15.3
         with:
           rustflags: ""
 
